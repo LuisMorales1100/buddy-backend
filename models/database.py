@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -85,11 +86,40 @@ def init_db():
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS products (
+            sku TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            features TEXT NOT NULL DEFAULT '{}'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
+
+        -- Migrations
+        ALTER TABLE users ADD COLUMN password_set INTEGER DEFAULT 0;
     """)
     conn.commit()
+    # Seed products from config file
+    _seed_products(conn)
     conn.close()
     print(f"[DB] Initialized at {DB_PATH}")
+
+
+def _seed_products(conn):
+    """Load products from config/products.json into DB"""
+    import pathlib
+    products_path = pathlib.Path(__file__).parent.parent / "config" / "products.json"
+    if not products_path.exists():
+        print("[DB] products.json not found, skipping seed")
+        return
+    with open(products_path) as f:
+        products = json.load(f)
+    for sku, data in products.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO products (sku, name, features) VALUES (?, ?, ?)",
+            (sku, data["name"], json.dumps(data["features"])),
+        )
+    conn.commit()
+    print(f"[DB] Seeded {len(products)} products")
 
 
 class UserModel:
@@ -107,6 +137,16 @@ class UserModel:
             return None
         finally:
             conn.close()
+
+    @staticmethod
+    def set_password(user_id: int, password_hash: str):
+        conn = get_db()
+        conn.execute(
+            "UPDATE users SET password_hash = ?, password_set = 1 WHERE id = ?",
+            (password_hash, user_id),
+        )
+        conn.commit()
+        conn.close()
 
     @staticmethod
     def get_by_email(email: str) -> Optional[dict]:
@@ -283,6 +323,33 @@ class UsageModel:
                 return False, "Límite diario de prueba alcanzado (20 mensajes). Creá una cuenta con el email de tu compra para acceso ilimitado."
         remaining = limit - daily
         return True, f"{remaining} solicitudes restantes hoy"
+
+
+class ProductModel:
+    @staticmethod
+    def get_features(sku: str) -> Optional[dict]:
+        conn = get_db()
+        row = conn.execute("SELECT features FROM products WHERE sku = ?", (sku,)).fetchone()
+        conn.close()
+        return json.loads(row["features"]) if row else None
+
+    @staticmethod
+    def get_user_products(user_id: int) -> list[dict]:
+        conn = get_db()
+        rows = conn.execute(
+            """SELECT p.sku, p.name, p.features, pu.verified
+               FROM purchases pu
+               JOIN products p ON pu.product_sku = p.sku
+               WHERE pu.user_id = ? AND pu.verified = 1""",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["features"] = json.loads(d["features"])
+            result.append(d)
+        return result
 
 
 class ConversationModel:
