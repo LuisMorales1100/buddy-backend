@@ -8,6 +8,11 @@ from typing import Optional
 router = APIRouter(prefix="/llm", tags=["LLM"])
 
 BUDDY_CLOUD_URL = os.getenv("BUDDY_CLOUD_LLM_URL", "")
+LLM_SERVICE_API_KEY = os.getenv("LLM_SERVICE_API_KEY", "")
+FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "")
+FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY", "")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # Sanitize API keys from error messages (never log/return user keys)
 API_KEY_PATTERNS = ["sk-", "sk-ant-", "x-api-key", "Bearer "]
@@ -66,21 +71,49 @@ async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
     # Increment usage counter
     UsageModel.increment(user_id)
 
-    try:
-        if request.provider == "openai":
-            return await proxy_openai(request)
-        elif request.provider == "anthropic":
-            return await proxy_anthropic(request)
-        elif request.provider == "ollama":
-            return await proxy_ollama(request)
-        elif request.provider == "buddy_cloud":
-            return await proxy_buddy_cloud(request)
-        elif request.provider in ("local", "custom"):
-            return await proxy_custom(request)
+    errors = []
+
+    async def try_provider(provider: str) -> LLMResponse:
+        req = request.model_copy(deep=True)
+        req.provider = provider
+        if not req.api_key and provider != "buddy_cloud":
+            req.api_key = FALLBACK_API_KEY
+        if provider == "openai":
+            return await proxy_openai(req)
+        elif provider == "anthropic":
+            return await proxy_anthropic(req)
+        elif provider == "ollama":
+            return await proxy_ollama(req)
+        elif provider == "buddy_cloud":
+            return await proxy_buddy_cloud(req)
+        elif provider in ("local", "custom"):
+            return await proxy_custom(req)
         else:
-            raise HTTPException(status_code=400, detail=f"Unknown provider: {request.provider}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=sanitize(str(e)))
+            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+
+    providers_to_try = [request.provider]
+    if request.provider == "buddy_cloud" and FALLBACK_PROVIDER:
+        providers_to_try.append(FALLBACK_PROVIDER)
+
+    for provider in providers_to_try:
+        try:
+            return await try_provider(provider)
+        except HTTPException as e:
+            if e.status_code < 500 or provider == providers_to_try[-1]:
+                raise
+            errors.append(f"{provider}: {e.detail}")
+            continue
+        except Exception as e:
+            if provider == providers_to_try[-1]:
+                raise HTTPException(status_code=502, detail=sanitize(str(e)))
+            errors.append(f"{provider}: {sanitize(str(e))}")
+            continue
+
+    # Should not reach here, but just in case
+    raise HTTPException(
+        status_code=502,
+        detail=f"All providers failed: {'; '.join(errors)}",
+    )
 
 
 async def proxy_openai(request: LLMRequest) -> LLMResponse:
@@ -208,9 +241,14 @@ async def proxy_buddy_cloud(request: LLMRequest) -> LLMResponse:
 
     messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
+    headers = {"Content-Type": "application/json"}
+    if LLM_SERVICE_API_KEY:
+        headers["x-api-key"] = LLM_SERVICE_API_KEY
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         res = await client.post(
             BUDDY_CLOUD_URL,
+            headers=headers,
             json={
                 "model": request.model or "buddy-llm",
                 "messages": messages,
