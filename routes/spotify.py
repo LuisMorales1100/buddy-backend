@@ -58,6 +58,27 @@ async def spotify_callback(code: str, error: str = None):
             "expires_in": data["expires_in"]
         }
 
+@router.post("/token")
+async def spotify_token(request: SpotifyTokenRequest):
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": get_auth_header()},
+            data={
+                "grant_type": "authorization_code",
+                "code": request.code,
+                "redirect_uri": REDIRECT_URI
+            }
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Token exchange failed")
+        data = res.json()
+        return {
+            "access_token": data["access_token"],
+            "refresh_token": data.get("refresh_token"),
+            "expires_in": data["expires_in"]
+        }
+
 @router.post("/refresh")
 async def spotify_refresh(request: SpotifyRefreshRequest):
     async with httpx.AsyncClient() as client:

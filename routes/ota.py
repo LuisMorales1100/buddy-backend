@@ -1,11 +1,21 @@
 import os
 import pathlib
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header, Depends
 from fastapi.responses import FileResponse, JSONResponse
 from models.schemas import OTACheckResponse
 from models.database import DeviceModel
+from typing import Optional
 
 router = APIRouter(prefix="/firmware", tags=["OTA"])
+
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+
+async def require_admin(x_admin_key: Optional[str] = Header(None)):
+    if not ADMIN_KEY:
+        return True
+    if not x_admin_key or x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin key")
 
 DOMAIN = os.getenv("DOMAIN", "api.buddyrobots.com")
 FIRMWARE_DIR = pathlib.Path(__file__).parent.parent / "public" / "firmware"
@@ -76,7 +86,7 @@ async def list_releases():
 
 
 @router.post("/admin/upload")
-async def upload_firmware(version: str, changelog: str = "", critical: bool = False):
+async def upload_firmware(version: str, changelog: str = "", critical: bool = False, _=Depends(require_admin)):
     """Admin endpoint to register a new firmware version.
     The .bin file must already exist in public/firmware/.
     """
