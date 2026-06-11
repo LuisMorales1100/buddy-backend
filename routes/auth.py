@@ -9,7 +9,7 @@ from typing import Optional
 
 JWT_SECRET = os.getenv("JWT_SECRET", "buddy_dev_secret_change_in_production")
 REFRESH_SECRET = os.getenv("REFRESH_SECRET", "buddy_refresh_dev_secret_change_in_production")
-TOKEN_EXPIRE_MINUTES = 30
+TOKEN_EXPIRE_MINUTES = 120
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 router = APIRouter(prefix="", tags=["Auth"])
