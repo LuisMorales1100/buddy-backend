@@ -25,6 +25,22 @@ def sanitize(msg: str) -> str:
     return msg[:500]
 
 
+@router.get("/health")
+async def llm_health():
+    if not BUDDY_CLOUD_URL:
+        raise HTTPException(status_code=503, detail="LLM service URL not configured")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.get(BUDDY_CLOUD_URL)
+            if res.status_code < 500:
+                return {"status": "ok", "llm_service": BUDDY_CLOUD_URL}
+            raise HTTPException(status_code=502, detail=f"LLM service returned {res.status_code}")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="LLM service timed out")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502, detail="LLM service unreachable")
+
+
 async def get_llm_auth(authorization: Optional[str] = Header(None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization[7:]
@@ -36,6 +52,10 @@ async def get_llm_auth(authorization: Optional[str] = Header(None)):
 
 @router.post("/chat", response_model=LLMResponse)
 async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
+    # Max messages per request
+    if len(request.messages) > 20:
+        raise HTTPException(status_code=400, detail="Demasiados mensajes en la solicitud (máx. 20)")
+
     from models.database import PurchaseModel, UsageModel
 
     user_id = auth.get("user_id")
@@ -245,7 +265,7 @@ async def proxy_buddy_cloud(request: LLMRequest) -> LLMResponse:
     if LLM_SERVICE_API_KEY:
         headers["x-api-key"] = LLM_SERVICE_API_KEY
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=None) as client:
         res = await client.post(
             BUDDY_CLOUD_URL,
             headers=headers,

@@ -7,7 +7,7 @@ class ChatMessage(BaseModel):
     content: str
 
 class LLMRequest(BaseModel):
-    provider: Literal["openai", "anthropic", "ollama", "custom", "local"]
+    provider: Literal["openai", "anthropic", "ollama", "custom", "local", "buddy_cloud"]
     messages: List[ChatMessage]
     model: Optional[str] = None
     temperature: float = 0.7

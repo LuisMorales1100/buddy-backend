@@ -20,6 +20,8 @@ async def create_conversation(
 ):
     from models.database import ConversationModel
 
+    if len(req.messages) > 50:
+        raise HTTPException(status_code=400, detail="La conversación no puede tener más de 50 mensajes")
     messages_json = json.dumps([m.model_dump() for m in req.messages])
     conv = ConversationModel.create(
         user["user_id"], title=req.title, messages=messages_json
@@ -35,6 +37,8 @@ async def update_conversation(
 ):
     from models.database import ConversationModel
 
+    if len(req.messages) > 50:
+        raise HTTPException(status_code=400, detail="La conversación no puede tener más de 50 mensajes")
     messages_json = json.dumps([m.model_dump() for m in req.messages])
     ok = ConversationModel.update(
         conv_id, user["user_id"], title=req.title, messages=messages_json
