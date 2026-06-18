@@ -1,9 +1,14 @@
 import os
+import json
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Header
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi.responses import StreamingResponse
 from models.schemas import LLMRequest, LLMResponse
 from routes.auth import decode_token
 from typing import Optional
+
+log = structlog.get_logger()
 
 router = APIRouter(prefix="/llm", tags=["LLM"])
 
@@ -14,7 +19,6 @@ FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY", "")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Sanitize API keys from error messages (never log/return user keys)
 API_KEY_PATTERNS = ["sk-", "sk-ant-", "x-api-key", "Bearer "]
 
 
@@ -50,9 +54,7 @@ async def get_llm_auth(authorization: Optional[str] = Header(None)):
     return {"role": "anonymous", "serial": "unknown"}
 
 
-@router.post("/chat", response_model=LLMResponse)
-async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
-    # Max messages per request
+def _usage_check(request: LLMRequest, auth: dict):
     if len(request.messages) > 20:
         raise HTTPException(status_code=400, detail="Demasiados mensajes en la solicitud (máx. 20)")
 
@@ -61,14 +63,12 @@ async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
     user_id = auth.get("user_id")
     role = auth.get("role", "anonymous")
 
-    # Anonymous users are blocked
     if role == "anonymous" or not user_id:
         raise HTTPException(
             status_code=402,
             detail="Debes iniciar sesión con una cuenta que haya comprado Buddy para usar Buddy Cloud LLM.",
         )
 
-    # Check daily usage limit
     can_request, msg = UsageModel.can_make_request(user_id)
     if not can_request:
         has_purchase = PurchaseModel.user_has_purchase(user_id)
@@ -79,7 +79,6 @@ async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
         )
         raise HTTPException(status_code=429, detail=limit_msg)
 
-    # Buddy Cloud LLM requires purchase verification
     if request.provider == "buddy_cloud":
         has_purchase = PurchaseModel.user_has_purchase(user_id)
         if not has_purchase:
@@ -88,8 +87,16 @@ async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
                 detail="Necesitás una compra verificada de Buddy para usar nuestro modelo. Iniciá sesión con el email que usaste al comprar.",
             )
 
-    # Increment usage counter
     UsageModel.increment(user_id)
+
+
+@router.post("/chat", response_model=LLMResponse)
+async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
+    log.info("chat.request", provider=request.provider, prompt=request.messages[-1].content[:80] if request.messages else "", user_id=auth.get("user_id"))
+    _usage_check(request, auth)
+
+    if BUDDY_CLOUD_URL and request.provider == "buddy_cloud":
+        return await proxy_buddy_cloud(request)
 
     errors = []
 
@@ -129,10 +136,58 @@ async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
             errors.append(f"{provider}: {sanitize(str(e))}")
             continue
 
-    # Should not reach here, but just in case
     raise HTTPException(
         status_code=502,
         detail=f"All providers failed: {'; '.join(errors)}",
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: LLMRequest, request_obj: Request, auth=Depends(get_llm_auth)):
+    log.info("chat.stream_request", provider=request.provider, prompt=request.messages[-1].content[:80] if request.messages else "", user_id=auth.get("user_id"))
+    _usage_check(request, auth)
+
+    if request.provider != "buddy_cloud" or not BUDDY_CLOUD_URL:
+        raise HTTPException(status_code=400, detail="Streaming solo disponible para Buddy Cloud")
+
+    return await proxy_buddy_cloud_stream(request)
+
+
+async def proxy_buddy_cloud_stream(request: LLMRequest):
+    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+
+    headers = {"Content-Type": "application/json"}
+    if LLM_SERVICE_API_KEY:
+        headers["x-api-key"] = LLM_SERVICE_API_KEY
+
+    async def sse_proxy():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                f"{BUDDY_CLOUD_URL}/stream",
+                headers=headers,
+                json={
+                    "model": request.model or "buddy-llm",
+                    "messages": messages,
+                    "temperature": request.temperature,
+                },
+            ) as resp:
+                if resp.status_code != 200:
+                    error_body = await resp.aread()
+                    yield f"event: error\ndata: {json.dumps({'error': sanitize(error_body.decode())})}\n\n"
+                    return
+                async for line in resp.aiter_lines():
+                    if line:
+                        yield line + "\n"
+
+    return StreamingResponse(
+        sse_proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
