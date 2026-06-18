@@ -1,125 +1,45 @@
-import sqlite3
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
-DB_PATH = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "..", "buddy.db"))
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import CursorResult
+
+# ── Connection ──────────────────────────────────────────────────
+DB_URL = os.getenv("DATABASE_URL", "postgresql://buddy:buddy@localhost:5432/buddy_db")
+
+_engine = None
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        _engine = create_engine(DB_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
+    return _engine
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = _get_engine().connect()
     return conn
 
 
-def init_db():
-    conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            name TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            shopify_customer_id TEXT,
-            stripe_customer_id TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            serial_number TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL DEFAULT 'Buddy',
-            firmware_version TEXT NOT NULL DEFAULT '4.0',
-            mac_address TEXT,
-            user_id INTEGER REFERENCES users(id),
-            paired_at TEXT,
-            last_seen TEXT,
-            is_online INTEGER DEFAULT 0,
-            ip_address TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS firmware_releases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            version TEXT UNIQUE NOT NULL,
-            changelog TEXT,
-            file_path TEXT NOT NULL,
-            file_size INTEGER DEFAULT 0,
-            critical INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS purchases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER REFERENCES users(id),
-            email TEXT NOT NULL,
-            shopify_order_id TEXT UNIQUE,
-            product_sku TEXT NOT NULL DEFAULT 'buddy_v1',
-            product_name TEXT NOT NULL DEFAULT 'Buddy Assistant',
-            order_created_at TEXT,
-            verified INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS llm_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER REFERENCES users(id),
-            date TEXT NOT NULL,
-            request_count INTEGER DEFAULT 0,
-            UNIQUE(user_id, date)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_purchases_email ON purchases(email);
-        CREATE INDEX IF NOT EXISTS idx_purchases_user ON purchases(user_id);
-        CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
-        CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number);
-
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER REFERENCES users(id),
-            title TEXT NOT NULL DEFAULT 'Nueva conversación',
-            messages TEXT NOT NULL DEFAULT '[]',
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            sku TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            features TEXT NOT NULL DEFAULT '{}'
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
-
-        -- Migrations
-        ALTER TABLE users ADD COLUMN password_set INTEGER DEFAULT 0;
-    """)
-    conn.commit()
-    # Seed products from config file
-    _seed_products(conn)
+def close_db(conn):
     conn.close()
-    print(f"[DB] Initialized at {DB_PATH}")
 
 
-def _seed_products(conn):
-    """Load products from config/products.json into DB"""
-    import pathlib
-    products_path = pathlib.Path(__file__).parent.parent / "config" / "products.json"
-    if not products_path.exists():
-        print("[DB] products.json not found, skipping seed")
-        return
-    with open(products_path) as f:
-        products = json.load(f)
-    for sku, data in products.items():
-        conn.execute(
-            "INSERT OR IGNORE INTO products (sku, name, features) VALUES (?, ?, ?)",
-            (sku, data["name"], json.dumps(data["features"])),
-        )
-    conn.commit()
-    print(f"[DB] Seeded {len(products)} products")
+def _row_to_dict(row):
+    """Convert a SQLAlchemy Row to dict (compat with old sqlite3.Row interface)."""
+    if row is None:
+        return None
+    return dict(row._mapping)
+
+
+def _rows_to_dicts(rows):
+    return [dict(r._mapping) for r in rows]
+
+
+# ── Model classes (PostgreSQL via SQLAlchemy) ──
 
 
 class UserModel:
@@ -127,47 +47,66 @@ class UserModel:
     def create(email: str, password_hash: str, name: str = "") -> Optional[int]:
         conn = get_db()
         try:
-            cur = conn.execute(
-                "INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)",
-                (email, password_hash, name),
+            result = conn.execute(
+                text("INSERT INTO users (email, password_hash, name) VALUES (:email, :password_hash, :name) RETURNING id"),
+                {"email": email, "password_hash": password_hash, "name": name},
             )
+            row = result.fetchone()
             conn.commit()
-            return cur.lastrowid
-        except sqlite3.IntegrityError:
+            return row[0] if row else None
+        except Exception:
+            conn.rollback()
             return None
         finally:
-            conn.close()
+            close_db(conn)
 
     @staticmethod
     def set_password(user_id: int, password_hash: str):
         conn = get_db()
-        conn.execute(
-            "UPDATE users SET password_hash = ?, password_set = 1 WHERE id = ?",
-            (password_hash, user_id),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                text("UPDATE users SET password_hash = :password_hash, password_set = 1 WHERE id = :id"),
+                {"password_hash": password_hash, "id": user_id},
+            )
+            conn.commit()
+        finally:
+            close_db(conn)
 
     @staticmethod
     def get_by_email(email: str) -> Optional[dict]:
         conn = get_db()
-        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-        conn.close()
-        return dict(row) if row else None
+        try:
+            result = conn.execute(
+                text("SELECT * FROM users WHERE email = :email"),
+                {"email": email},
+            )
+            return _row_to_dict(result.fetchone())
+        finally:
+            close_db(conn)
 
     @staticmethod
     def get_by_id(user_id: int) -> Optional[dict]:
         conn = get_db()
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        conn.close()
-        return dict(row) if row else None
+        try:
+            result = conn.execute(
+                text("SELECT * FROM users WHERE id = :id"),
+                {"id": user_id},
+            )
+            return _row_to_dict(result.fetchone())
+        finally:
+            close_db(conn)
 
     @staticmethod
     def set_shopify_id(user_id: int, shopify_id: str):
         conn = get_db()
-        conn.execute("UPDATE users SET shopify_customer_id = ? WHERE id = ?", (shopify_id, user_id))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                text("UPDATE users SET shopify_customer_id = :shopify_id WHERE id = :id"),
+                {"shopify_id": shopify_id, "id": user_id},
+            )
+            conn.commit()
+        finally:
+            close_db(conn)
 
 
 class DeviceModel:
@@ -176,65 +115,75 @@ class DeviceModel:
         conn = get_db()
         try:
             conn.execute(
-                "INSERT OR IGNORE INTO devices (serial_number, name, firmware_version, mac_address) VALUES (?, ?, ?, ?)",
-                (serial, name, fw_version, mac),
+                text("INSERT INTO devices (serial_number, name, firmware_version, mac_address) "
+                     "VALUES (:serial, :name, :fw, :mac) ON CONFLICT (serial_number) DO NOTHING"),
+                {"serial": serial, "name": name, "fw": fw_version, "mac": mac},
             )
             conn.commit()
             return True
         finally:
-            conn.close()
+            close_db(conn)
 
     @staticmethod
     def get_by_serial(serial: str) -> Optional[dict]:
         conn = get_db()
-        row = conn.execute(
-            "SELECT * FROM devices WHERE serial_number = ?", (serial,)
-        ).fetchone()
-        conn.close()
-        return dict(row) if row else None
+        try:
+            result = conn.execute(
+                text("SELECT * FROM devices WHERE serial_number = :serial"),
+                {"serial": serial},
+            )
+            return _row_to_dict(result.fetchone())
+        finally:
+            close_db(conn)
 
     @staticmethod
     def pair(serial: str, user_id: int) -> bool:
         conn = get_db()
-        now = datetime.utcnow().isoformat()
-        conn.execute(
-            "UPDATE devices SET user_id = ?, paired_at = ? WHERE serial_number = ?",
-            (user_id, now, serial),
-        )
-        conn.commit()
-        conn.close()
-        return True
+        try:
+            conn.execute(
+                text("UPDATE devices SET user_id = :user_id, paired_at = NOW() WHERE serial_number = :serial"),
+                {"user_id": user_id, "serial": serial},
+            )
+            conn.commit()
+            return True
+        finally:
+            close_db(conn)
 
     @staticmethod
     def get_user_devices(user_id: int) -> list[dict]:
         conn = get_db()
-        rows = conn.execute(
-            "SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen DESC",
-            (user_id,),
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        try:
+            result = conn.execute(
+                text("SELECT * FROM devices WHERE user_id = :user_id ORDER BY last_seen DESC"),
+                {"user_id": user_id},
+            )
+            return _rows_to_dicts(result.fetchall())
+        finally:
+            close_db(conn)
 
     @staticmethod
     def update_last_seen(serial: str, ip: str, online: bool = True):
         conn = get_db()
-        now = datetime.utcnow().isoformat()
-        conn.execute(
-            "UPDATE devices SET last_seen = ?, ip_address = ?, is_online = ? WHERE serial_number = ?",
-            (now, ip, int(online), serial),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                text("UPDATE devices SET last_seen = NOW(), ip_address = :ip, is_online = :online WHERE serial_number = :serial"),
+                {"ip": ip, "online": int(online), "serial": serial},
+            )
+            conn.commit()
+        finally:
+            close_db(conn)
 
     @staticmethod
     def set_firmware_version(serial: str, version: str):
         conn = get_db()
-        conn.execute(
-            "UPDATE devices SET firmware_version = ? WHERE serial_number = ?",
-            (version, serial),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                text("UPDATE devices SET firmware_version = :version WHERE serial_number = :serial"),
+                {"version": version, "serial": serial},
+            )
+            conn.commit()
+        finally:
+            close_db(conn)
 
 
 class PurchaseModel:
@@ -243,40 +192,67 @@ class PurchaseModel:
         conn = get_db()
         try:
             conn.execute(
-                "INSERT OR IGNORE INTO purchases (email, shopify_order_id, product_sku, product_name, order_created_at) VALUES (?, ?, ?, ?, datetime('now'))",
-                (email, shopify_order_id, product_sku, product_name),
+                text("INSERT INTO purchases (email, shopify_order_id, product_sku, product_name, order_created_at) "
+                     "VALUES (:email, :order_id, :sku, :name, NOW()) ON CONFLICT (shopify_order_id) DO NOTHING"),
+                {"email": email, "order_id": shopify_order_id, "sku": product_sku, "name": product_name},
             )
             conn.commit()
             return True
         except Exception as e:
             print(f"[Purchase] Error: {e}")
+            conn.rollback()
             return False
         finally:
-            conn.close()
+            close_db(conn)
+
+    @staticmethod
+    def verify_by_order_id(order_id: str) -> bool:
+        conn = get_db()
+        try:
+            result = conn.execute(
+                text("UPDATE purchases SET verified = 1 WHERE shopify_order_id = :order_id"),
+                {"order_id": order_id},
+            )
+            conn.commit()
+            return result.rowcount > 0
+        finally:
+            close_db(conn)
 
     @staticmethod
     def link_to_user(email: str, user_id: int):
         conn = get_db()
-        conn.execute("UPDATE purchases SET user_id = ?, verified = 1 WHERE email = ? AND user_id IS NULL", (user_id, email))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                text("UPDATE purchases SET user_id = :user_id, verified = 1 WHERE email = :email AND user_id IS NULL"),
+                {"user_id": user_id, "email": email},
+            )
+            conn.commit()
+        finally:
+            close_db(conn)
 
     @staticmethod
     def user_has_purchase(user_id: int) -> bool:
         conn = get_db()
-        row = conn.execute(
-            "SELECT id FROM purchases WHERE user_id = ? AND verified = 1 LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        conn.close()
-        return row is not None
+        try:
+            result = conn.execute(
+                text("SELECT id FROM purchases WHERE user_id = :user_id AND verified = 1 LIMIT 1"),
+                {"user_id": user_id},
+            )
+            return result.fetchone() is not None
+        finally:
+            close_db(conn)
 
     @staticmethod
     def get_by_email(email: str) -> Optional[dict]:
         conn = get_db()
-        row = conn.execute("SELECT * FROM purchases WHERE email = ? LIMIT 1", (email,)).fetchone()
-        conn.close()
-        return dict(row) if row else None
+        try:
+            result = conn.execute(
+                text("SELECT * FROM purchases WHERE email = :email LIMIT 1"),
+                {"email": email},
+            )
+            return _row_to_dict(result.fetchone())
+        finally:
+            close_db(conn)
 
 
 class UsageModel:
@@ -286,29 +262,36 @@ class UsageModel:
     @staticmethod
     def get_daily_count(user_id: int) -> int:
         conn = get_db()
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        row = conn.execute(
-            "SELECT request_count FROM llm_usage WHERE user_id = ? AND date = ?",
-            (user_id, today),
-        ).fetchone()
-        conn.close()
-        return row["request_count"] if row else 0
+        try:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            result = conn.execute(
+                text("SELECT request_count FROM llm_usage WHERE user_id = :user_id AND date = :date"),
+                {"user_id": user_id, "date": today},
+            )
+            row = result.fetchone()
+            return row[0] if row else 0
+        finally:
+            close_db(conn)
 
     @staticmethod
     def increment(user_id: int) -> int:
         conn = get_db()
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        conn.execute(
-            "INSERT INTO llm_usage (user_id, date, request_count) VALUES (?, ?, 1) ON CONFLICT(user_id, date) DO UPDATE SET request_count = request_count + 1",
-            (user_id, today),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT request_count FROM llm_usage WHERE user_id = ? AND date = ?",
-            (user_id, today),
-        ).fetchone()
-        conn.close()
-        return row["request_count"] if row else 0
+        try:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            conn.execute(
+                text("INSERT INTO llm_usage (user_id, date, request_count) VALUES (:user_id, :date, 1) "
+                     "ON CONFLICT (user_id, date) DO UPDATE SET request_count = llm_usage.request_count + 1"),
+                {"user_id": user_id, "date": today},
+            )
+            conn.commit()
+            result = conn.execute(
+                text("SELECT request_count FROM llm_usage WHERE user_id = :user_id AND date = :date"),
+                {"user_id": user_id, "date": today},
+            )
+            row = result.fetchone()
+            return row[0] if row else 0
+        finally:
+            close_db(conn)
 
     @staticmethod
     def can_make_request(user_id: int) -> tuple[bool, str]:
@@ -316,7 +299,6 @@ class UsageModel:
         has_purchase = PurchaseModel.user_has_purchase(user_id)
         limit = UsageModel.DAILY_LIMIT_PAID if has_purchase else UsageModel.DAILY_LIMIT_FREE
         if daily >= limit:
-            remaining = 0
             if has_purchase:
                 return False, "Has alcanzado el límite diario de Buddy Cloud. Intentá de nuevo mañana."
             else:
@@ -329,90 +311,149 @@ class ProductModel:
     @staticmethod
     def get_features(sku: str) -> Optional[dict]:
         conn = get_db()
-        row = conn.execute("SELECT features FROM products WHERE sku = ?", (sku,)).fetchone()
-        conn.close()
-        return json.loads(row["features"]) if row else None
+        try:
+            result = conn.execute(
+                text("SELECT features FROM products WHERE sku = :sku"),
+                {"sku": sku},
+            )
+            row = result.fetchone()
+            return json.loads(row[0]) if row else None
+        finally:
+            close_db(conn)
 
     @staticmethod
     def get_user_products(user_id: int) -> list[dict]:
         conn = get_db()
-        rows = conn.execute(
-            """SELECT p.sku, p.name, p.features, pu.verified
-               FROM purchases pu
-               JOIN products p ON pu.product_sku = p.sku
-               WHERE pu.user_id = ? AND pu.verified = 1""",
-            (user_id,),
-        ).fetchall()
-        conn.close()
-        result = []
-        for r in rows:
-            d = dict(r)
-            d["features"] = json.loads(d["features"])
-            result.append(d)
-        return result
+        try:
+            result = conn.execute(
+                text("SELECT p.sku, p.name, p.features, pu.verified "
+                     "FROM purchases pu "
+                     "JOIN products p ON pu.product_sku = p.sku "
+                     "WHERE pu.user_id = :user_id AND pu.verified = 1"),
+                {"user_id": user_id},
+            )
+            rows = result.fetchall()
+            result_list = []
+            for r in rows:
+                d = dict(r._mapping)
+                d["features"] = json.loads(d["features"])
+                result_list.append(d)
+            return result_list
+        finally:
+            close_db(conn)
+
+
+class FirmwareReleaseModel:
+    @staticmethod
+    def get_latest() -> Optional[dict]:
+        conn = get_db()
+        try:
+            result = conn.execute(
+                text("SELECT * FROM firmware_releases ORDER BY id DESC LIMIT 1")
+            )
+            return _row_to_dict(result.fetchone())
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def list_all() -> list[dict]:
+        conn = get_db()
+        try:
+            result = conn.execute(
+                text("SELECT version, changelog, file_size, critical, created_at FROM firmware_releases ORDER BY id DESC")
+            )
+            return _rows_to_dicts(result.fetchall())
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def create(version: str, changelog: str, file_path: str, file_size: int, critical: bool = False) -> bool:
+        conn = get_db()
+        try:
+            conn.execute(
+                text("INSERT INTO firmware_releases (version, changelog, file_path, file_size, critical) "
+                     "VALUES (:version, :changelog, :file_path, :file_size, :critical)"),
+                {"version": version, "changelog": changelog,
+                 "file_path": file_path, "file_size": file_size, "critical": int(critical)},
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            return False
+        finally:
+            close_db(conn)
 
 
 class ConversationModel:
     @staticmethod
     def get_by_user(user_id: int) -> list[dict]:
         conn = get_db()
-        rows = conn.execute(
-            "SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC",
-            (user_id,),
-        ).fetchall()
-        conn.close()
-        result = []
-        for r in rows:
-            d = dict(r)
-            try:
-                d["messages"] = __import__("json").loads(d["messages"])
-            except (__import__("json").JSONDecodeError, TypeError):
-                d["messages"] = []
-            result.append(d)
-        return result
+        try:
+            result = conn.execute(
+                text("SELECT * FROM conversations WHERE user_id = :user_id ORDER BY updated_at DESC"),
+                {"user_id": user_id},
+            )
+            rows = result.fetchall()
+            result_list = []
+            for r in rows:
+                d = dict(r._mapping)
+                try:
+                    d["messages"] = json.loads(d["messages"])
+                except (json.JSONDecodeError, TypeError):
+                    d["messages"] = []
+                result_list.append(d)
+            return result_list
+        finally:
+            close_db(conn)
 
     @staticmethod
     def create(user_id: int, title: str = "Nueva conversación", messages: str = "[]") -> Optional[dict]:
         conn = get_db()
         try:
-            cur = conn.execute(
-                "INSERT INTO conversations (user_id, title, messages) VALUES (?, ?, ?)",
-                (user_id, title, messages),
+            result = conn.execute(
+                text("INSERT INTO conversations (user_id, title, messages) VALUES (:user_id, :title, :messages) RETURNING *"),
+                {"user_id": user_id, "title": title, "messages": messages},
             )
+            row = result.fetchone()
             conn.commit()
-            row = conn.execute(
-                "SELECT * FROM conversations WHERE id = ?", (cur.lastrowid,)
-            ).fetchone()
-            conn.close()
-            d = dict(row)
-            try:
-                d["messages"] = __import__("json").loads(d["messages"])
-            except Exception:
-                d["messages"] = []
-            return d
+            if row:
+                d = dict(row._mapping)
+                try:
+                    d["messages"] = json.loads(d["messages"])
+                except Exception:
+                    d["messages"] = []
+                return d
+            return None
         except Exception as e:
-            conn.close()
+            conn.rollback()
             raise e
+        finally:
+            close_db(conn)
 
     @staticmethod
     def update(conv_id: int, user_id: int, title: str, messages: str) -> bool:
         conn = get_db()
-        now = datetime.utcnow().isoformat()
-        cur = conn.execute(
-            "UPDATE conversations SET title = ?, messages = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-            (title, messages, now, conv_id, user_id),
-        )
-        conn.commit()
-        conn.close()
-        return cur.rowcount > 0
+        try:
+            result = conn.execute(
+                text("UPDATE conversations SET title = :title, messages = :messages, updated_at = NOW() "
+                     "WHERE id = :id AND user_id = :user_id"),
+                {"title": title, "messages": messages, "id": conv_id, "user_id": user_id},
+            )
+            conn.commit()
+            return result.rowcount > 0
+        finally:
+            close_db(conn)
 
     @staticmethod
     def delete(conv_id: int, user_id: int) -> bool:
         conn = get_db()
-        cur = conn.execute(
-            "DELETE FROM conversations WHERE id = ? AND user_id = ?",
-            (conv_id, user_id),
-        )
-        conn.commit()
-        conn.close()
-        return cur.rowcount > 0
+        try:
+            result = conn.execute(
+                text("DELETE FROM conversations WHERE id = :id AND user_id = :user_id"),
+                {"id": conv_id, "user_id": user_id},
+            )
+            conn.commit()
+            return result.rowcount > 0
+        finally:
+            close_db(conn)
