@@ -3,7 +3,7 @@ import pathlib
 from fastapi import APIRouter, HTTPException, Header, Depends
 from fastapi.responses import FileResponse, JSONResponse
 from models.schemas import OTACheckResponse
-from models.database import DeviceModel
+from models.database import DeviceModel, FirmwareReleaseModel
 from typing import Optional
 
 router = APIRouter(prefix="/firmware", tags=["OTA"])
@@ -24,21 +24,12 @@ os.makedirs(FIRMWARE_DIR, exist_ok=True)
 
 @router.get("/check", response_model=OTACheckResponse)
 async def check_update(version: str = "0.0", serial: str = ""):
-    # Get latest firmware from database
-    import sqlite3
-    conn = sqlite3.connect(
-        pathlib.Path(__file__).parent.parent / "buddy.db"
-    )
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM firmware_releases ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
+    latest = FirmwareReleaseModel.get_latest()
 
-    if row:
-        current = row["version"]
-        changelog = row["changelog"]
-        critical = bool(row["critical"])
+    if latest:
+        current = latest["version"]
+        changelog = latest["changelog"]
+        critical = bool(latest["critical"])
     else:
         current = "4.0"
         changelog = "Initial OTA release"
@@ -73,16 +64,8 @@ async def download_firmware(version: str = "4.0"):
 
 @router.get("/releases")
 async def list_releases():
-    import sqlite3
-    conn = sqlite3.connect(
-        pathlib.Path(__file__).parent.parent / "buddy.db"
-    )
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT version, changelog, file_size, critical, created_at FROM firmware_releases ORDER BY id DESC"
-    ).fetchall()
-    conn.close()
-    return {"releases": [dict(r) for r in rows]}
+    releases = FirmwareReleaseModel.list_all()
+    return {"releases": releases}
 
 
 @router.post("/admin/upload")
@@ -90,25 +73,15 @@ async def upload_firmware(version: str, changelog: str = "", critical: bool = Fa
     """Admin endpoint to register a new firmware version.
     The .bin file must already exist in public/firmware/.
     """
-    import sqlite3
     file_path = FIRMWARE_DIR / f"buddy_firmware_v{version}.bin"
     if not file_path.exists():
         raise HTTPException(status_code=400, detail=f"File buddy_firmware_v{version}.bin not found in {FIRMWARE_DIR}")
 
     file_size = file_path.stat().st_size
-    conn = sqlite3.connect(
-        pathlib.Path(__file__).parent.parent / "buddy.db"
-    )
-    try:
-        conn.execute(
-            "INSERT INTO firmware_releases (version, changelog, file_path, file_size, critical) VALUES (?, ?, ?, ?, ?)",
-            (version, changelog, str(file_path), file_size, int(critical)),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
+    ok = FirmwareReleaseModel.create(version, changelog, str(file_path), file_size, critical)
+
+    if not ok:
         raise HTTPException(status_code=409, detail=f"Version {version} already exists")
-    conn.close()
 
     return {
         "status": "registered",
