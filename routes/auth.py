@@ -3,16 +3,102 @@ import hashlib
 import secrets
 import bcrypt
 from datetime import datetime, timedelta
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Depends, Response, Request
 from pydantic import BaseModel
 from typing import Optional
+from jose import jwt as jose_jwt, JWTError
+from services.limiter import limiter
 
-JWT_SECRET = os.getenv("JWT_SECRET", "buddy_dev_secret_change_in_production")
-REFRESH_SECRET = os.getenv("REFRESH_SECRET", "buddy_refresh_dev_secret_change_in_production")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+REFRESH_SECRET = os.getenv("REFRESH_SECRET", "")
+ENV = os.getenv("ENV", "development")
+
+if not JWT_SECRET or not REFRESH_SECRET:
+    if ENV == "production":
+        raise RuntimeError(
+            "JWT_SECRET and REFRESH_SECRET must be set in production. "
+            "Generate them with: openssl rand -hex 32"
+        )
+    print("[WARN] JWT_SECRET/REFRESH_SECRET not set — using dev-only fallback")
+    JWT_SECRET = "dev_only_insecure_" + os.urandom(16).hex()
+    REFRESH_SECRET = "dev_only_insecure_" + os.urandom(16).hex()
+
+if ENV == "production" and JWT_SECRET in (
+    "buddy_super_secret_key_cambiar_en_produccion",
+    "buddy_dev_secret_change_in_production",
+    "",
+):
+    raise RuntimeError(
+        "JWT_SECRET is still set to the default value. "
+        "Generate a new one with: openssl rand -hex 32"
+    )
+
 TOKEN_EXPIRE_MINUTES = 120
 REFRESH_TOKEN_EXPIRE_DAYS = 30
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "")
+COOKIE_SECURE = os.getenv("ENV", "development") == "production"
 
 router = APIRouter(prefix="", tags=["Auth"])
+
+
+def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
+    """Set httpOnly auth cookies on the response.
+    
+    Browser clients receive httpOnly cookies (XSS-safe).
+    Non-browser clients (ESP32) continue using the JSON body + Authorization header.
+    """
+    secure = COOKIE_SECURE
+    samesite = "none" if secure else "lax"
+    
+    response.set_cookie(
+        key="buddy_token",
+        value=access_token,
+        max_age=TOKEN_EXPIRE_MINUTES * 60,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        domain=COOKIE_DOMAIN if secure else None,
+        path="/",
+    )
+    response.set_cookie(
+        key="buddy_refresh",
+        value=refresh_token,
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        domain=COOKIE_DOMAIN if secure else None,
+        path="/v1/auth/refresh",
+    )
+
+
+def clear_auth_cookies(response: Response):
+    """Clear auth cookies on logout."""
+    for cookie in ("buddy_token", "buddy_refresh"):
+        response.set_cookie(
+            key=cookie,
+            value="",
+            max_age=0,
+            httponly=True,
+            secure=COOKIE_SECURE,
+            samesite="lax",
+            domain=COOKIE_DOMAIN if COOKIE_SECURE else None,
+            path="/",
+        )
+
+
+def get_token_from_request(request: Request, authorization: Optional[str] = None) -> Optional[str]:
+    """Extract token: try cookie first, then Authorization header.
+    
+    This allows browser clients to use httpOnly cookies (XSS-safe),
+    while device/API clients continue using the Authorization header.
+    """
+    token = request.cookies.get("buddy_token")
+    if token:
+        return token
+    if authorization and authorization.startswith("Bearer "):
+        return authorization[7:]
+    return None
 
 
 class RegisterRequest(BaseModel):
@@ -66,40 +152,35 @@ def verify_password(password: str, stored: str) -> bool:
     return h == expected
 
 
-def _b64encode(data: bytes) -> str:
-    import base64
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+# ---- JWT usando python-jose (HMAC-SHA256 estándar) ----
+
+def _encode_jwt(payload: dict, secret: str) -> str:
+    return jose_jwt.encode(payload, secret, algorithm="HS256")
 
 
-def _b64decode(s: str) -> bytes:
-    import base64
-    padding = 4 - len(s) % 4
-    if padding != 4:
-        s += "=" * padding
-    return base64.urlsafe_b64decode(s)
-
-
-def _sign(payload: dict, secret: str) -> str:
-    header_b64 = _b64encode(b'{"alg":"HS256","typ":"JWT"}')
-    payload_b64 = _b64encode(
-        __import__("json").dumps(payload, separators=(",", ":")).encode()
-    )
-    sig_input = f"{header_b64}.{payload_b64}"
-    sig = hashlib.sha256((sig_input + secret).encode()).hexdigest()
-    sig_b64 = _b64encode(sig.encode())
-    return f"{header_b64}.{payload_b64}.{sig_b64}"
-
-
-def _verify(token: str, secret: str) -> Optional[dict]:
+def _decode_jwt(token: str, secret: str) -> Optional[dict]:
     try:
+        payload = jose_jwt.decode(token, secret, algorithms=["HS256"])
+        if payload.get("exp", 0) < datetime.utcnow().timestamp():
+            return None
+        return payload
+    except JWTError:
+        return None
+
+
+def _verify_legacy(token: str, secret: str) -> Optional[dict]:
+    """Verifica tokens creados con la implementación anterior (pre-python-jose)."""
+    try:
+        import base64 as b64
         parts = token.split(".")
         if len(parts) != 3:
             return None
-        import json
-        payload = json.loads(_b64decode(parts[1]))
+        payload = __import__("json").loads(
+            b64.urlsafe_b64decode(parts[1] + "==").decode()
+        )
         sig_input = f"{parts[0]}.{parts[1]}"
         expected_sig = hashlib.sha256((sig_input + secret).encode()).hexdigest()
-        sig_b64 = _b64encode(expected_sig.encode())
+        sig_b64 = b64.urlsafe_b64encode(expected_sig.encode()).rstrip(b"=").decode()
         if sig_b64 != parts[2]:
             return None
         if payload.get("exp", 0) < datetime.utcnow().timestamp():
@@ -109,30 +190,48 @@ def _verify(token: str, secret: str) -> Optional[dict]:
         return None
 
 
+def _verify(token: str, secret: str) -> Optional[dict]:
+    """Intenta nuevo método primero, fallback a legacy para migración."""
+    payload = _decode_jwt(token, secret)
+    if payload:
+        return payload
+    return _verify_legacy(token, secret)
+
+
 def create_access_token(payload: dict) -> str:
     exp = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
-    payload["exp"] = int(exp.timestamp())
-    payload["iat"] = int(datetime.utcnow().timestamp())
-    payload["type"] = "access"
-    return _sign(payload, JWT_SECRET)
+    token_payload = {
+        **payload,
+        "exp": int(exp.timestamp()),
+        "iat": int(datetime.utcnow().timestamp()),
+        "type": "access",
+    }
+    return _encode_jwt(token_payload, JWT_SECRET)
 
 
 def create_refresh_token(payload: dict) -> str:
     exp = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    payload["exp"] = int(exp.timestamp())
-    payload["iat"] = int(datetime.utcnow().timestamp())
-    payload["type"] = "refresh"
-    return _sign(payload, REFRESH_SECRET)
+    token_payload = {
+        **payload,
+        "exp": int(exp.timestamp()),
+        "iat": int(datetime.utcnow().timestamp()),
+        "type": "refresh",
+    }
+    return _encode_jwt(token_payload, REFRESH_SECRET)
 
 
 def decode_token(token: str) -> Optional[dict]:
     return _verify(token, JWT_SECRET)
 
 
-async def get_current_user(authorization: Optional[str] = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
+async def get_current_user(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Get current user from cookie (browser) or Authorization header (API/device)."""
+    token = get_token_from_request(request, authorization)
+    if not token:
         raise HTTPException(status_code=401, detail="Missing or invalid token")
-    token = authorization[7:]
     payload = decode_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -148,7 +247,8 @@ def internal_register(email: str, name: str = "") -> Optional[int]:
 # ===== Routes =====
 
 @router.post("/auth/login")
-async def login(req: LoginRequest):
+@limiter.limit("10/minute")
+async def login(request: Request, req: LoginRequest, response: Response):
     from models.database import UserModel, PurchaseModel, ProductModel
 
     user = UserModel.get_by_email(req.email)
@@ -173,9 +273,15 @@ async def login(req: LoginRequest):
     products = ProductModel.get_user_products(user["id"])
 
     payload = {"user_id": user["id"], "email": user["email"], "role": "user"}
+    access_token = create_access_token(payload)
+    refresh_token = create_refresh_token(payload)
+
+    # Set httpOnly cookies for browser clients (XSS-safe)
+    set_auth_cookies(response, access_token, refresh_token)
+
     return {
-        "token": create_access_token(payload),
-        "refresh_token": create_refresh_token(payload),
+        "token": access_token,
+        "refresh_token": refresh_token,
         "user_id": user["id"],
         "email": user["email"],
         "name": user["name"],
@@ -205,8 +311,10 @@ async def set_password(req: SetPasswordRequest):
 
 
 @router.post("/auth/refresh")
-async def refresh(req: RefreshRequest):
-    payload = _verify(req.refresh_token, REFRESH_SECRET)
+async def refresh(req: RefreshRequest, response: Response, request: Request):
+    # Try refresh from cookie first, then request body
+    refresh_token = request.cookies.get("buddy_refresh") or req.refresh_token
+    payload = _verify(refresh_token, REFRESH_SECRET)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
@@ -215,10 +323,22 @@ async def refresh(req: RefreshRequest):
         "email": payload["email"],
         "role": payload.get("role", "user"),
     }
+    access_token = create_access_token(fresh_payload)
+    new_refresh_token = create_refresh_token(fresh_payload)
+
+    set_auth_cookies(response, access_token, new_refresh_token)
+
     return {
-        "token": create_access_token(fresh_payload),
-        "refresh_token": create_refresh_token(fresh_payload),
+        "token": access_token,
+        "refresh_token": new_refresh_token,
     }
+
+
+@router.post("/auth/logout")
+async def logout(response: Response):
+    """Clear auth cookies. Client should also clear localStorage tokens."""
+    clear_auth_cookies(response)
+    return {"status": "ok", "message": "Sesión cerrada"}
 
 
 @router.get("/auth/me")
