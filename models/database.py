@@ -387,13 +387,19 @@ class FirmwareReleaseModel:
 
 class ConversationModel:
     @staticmethod
-    def get_by_user(user_id: int) -> list[dict]:
+    def get_by_user(user_id: int, include_deleted: bool = False) -> list[dict]:
         conn = get_db()
         try:
-            result = conn.execute(
-                text("SELECT * FROM conversations WHERE user_id = :user_id ORDER BY updated_at DESC"),
-                {"user_id": user_id},
-            )
+            if include_deleted:
+                result = conn.execute(
+                    text("SELECT * FROM conversations WHERE user_id = :user_id ORDER BY updated_at DESC"),
+                    {"user_id": user_id},
+                )
+            else:
+                result = conn.execute(
+                    text("SELECT * FROM conversations WHERE user_id = :user_id AND status = 'active' ORDER BY updated_at DESC"),
+                    {"user_id": user_id},
+                )
             rows = result.fetchall()
             result_list = []
             for r in rows:
@@ -450,10 +456,135 @@ class ConversationModel:
         conn = get_db()
         try:
             result = conn.execute(
-                text("DELETE FROM conversations WHERE id = :id AND user_id = :user_id"),
+                text("UPDATE conversations SET status = 'deleted', deleted_at = NOW() "
+                     "WHERE id = :id AND user_id = :user_id AND status = 'active'"),
                 {"id": conv_id, "user_id": user_id},
             )
             conn.commit()
             return result.rowcount > 0
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def restore(conv_id: int, user_id: int) -> bool:
+        conn = get_db()
+        try:
+            result = conn.execute(
+                text("UPDATE conversations SET status = 'active', deleted_at = NULL "
+                     "WHERE id = :id AND user_id = :user_id AND status = 'deleted'"),
+                {"id": conv_id, "user_id": user_id},
+            )
+            conn.commit()
+            return result.rowcount > 0
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def create_sync(user_id: int, device_id: str, source: str, title: str = None) -> Optional[dict]:
+        conn = get_db()
+        try:
+            if not title:
+                title = "Nueva conversación"
+            result = conn.execute(
+                text("INSERT INTO conversations (user_id, device_id, source, title) "
+                     "VALUES (:user_id, :device_id, :source, :title) RETURNING *"),
+                {"user_id": user_id, "device_id": device_id, "source": source, "title": title},
+            )
+            row = result.fetchone()
+            conn.commit()
+            return dict(row._mapping) if row else None
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def get_sync_list(user_id: int, device_id: str = None, source: str = None,
+                       include_deleted: bool = False,
+                       limit: int = 50, offset: int = 0) -> list[dict]:
+        conn = get_db()
+        try:
+            conditions = ["user_id = :user_id"]
+            params = {"user_id": user_id, "limit": limit, "offset": offset}
+            if device_id:
+                conditions.append("device_id = :device_id")
+                params["device_id"] = device_id
+            if source:
+                conditions.append("source = :source")
+                params["source"] = source
+            if not include_deleted:
+                conditions.append("status = 'active'")
+            where = " AND ".join(conditions)
+            result = conn.execute(
+                text(f"SELECT * FROM conversations WHERE {where} ORDER BY updated_at DESC LIMIT :limit OFFSET :offset"),
+                params,
+            )
+            return _rows_to_dicts(result.fetchall())
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def get_sync_one(conv_id: int, user_id: int) -> Optional[dict]:
+        conn = get_db()
+        try:
+            result = conn.execute(
+                text("SELECT * FROM conversations WHERE id = :id AND user_id = :user_id"),
+                {"id": conv_id, "user_id": user_id},
+            )
+            row = result.fetchone()
+            return dict(row._mapping) if row else None
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def delete_sync(conv_id: int, user_id: int) -> bool:
+        conn = get_db()
+        try:
+            result = conn.execute(
+                text("UPDATE conversations SET status = 'deleted', deleted_at = NOW() "
+                     "WHERE id = :id AND user_id = :user_id AND status = 'active'"),
+                {"id": conv_id, "user_id": user_id},
+            )
+            conn.commit()
+            return result.rowcount > 0
+        finally:
+            close_db(conn)
+
+    @staticmethod
+    def get_messages(conv_id: int) -> list[dict]:
+        conn = get_db()
+        try:
+            result = conn.execute(
+                text("SELECT * FROM conversation_messages WHERE conversation_id = :conv_id ORDER BY created_at"),
+                {"conv_id": conv_id},
+            )
+            return _rows_to_dicts(result.fetchall())
+        finally:
+            close_db(conn)
+
+
+class ConversationMessageModel:
+    @staticmethod
+    def create(conversation_id: int, role: str, content: str,
+               audio_url: str = None, audio_duration_ms: int = None,
+               expression: str = None, msg_id: str = None) -> Optional[dict]:
+        conn = get_db()
+        try:
+            if not msg_id:
+                import uuid
+                msg_id = str(uuid.uuid4())
+            result = conn.execute(
+                text("INSERT INTO conversation_messages (id, conversation_id, role, content, audio_url, audio_duration_ms, expression) "
+                     "VALUES (:id, :conv_id, :role, :content, :audio_url, :audio_duration_ms, :expression) RETURNING *"),
+                {"id": msg_id, "conv_id": conversation_id, "role": role, "content": content,
+                 "audio_url": audio_url, "audio_duration_ms": audio_duration_ms, "expression": expression},
+            )
+            row = result.fetchone()
+            conn.commit()
+            return dict(row._mapping) if row else None
+        except Exception as e:
+            conn.rollback()
+            raise e
         finally:
             close_db(conn)

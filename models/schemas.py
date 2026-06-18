@@ -71,3 +71,43 @@ class ConversationCreate(BaseModel):
 class ConversationUpdate(BaseModel):
     title: str
     messages: list[ConversationMessage]
+
+# Conversation sync (voice/text)
+class SyncMessageCreate(BaseModel):
+    role: str  # 'user' or 'assistant'
+    content: str
+    audio_url: Optional[str] = None
+    audio_duration_ms: Optional[int] = None
+    expression: Optional[str] = None
+
+class SyncConversationCreate(BaseModel):
+    device_id: str
+    title: Optional[str] = None
+    source: str = 'text'  # 'voice' or 'text'
+    messages: list[SyncMessageCreate]
+
+class SyncMessageResponse(BaseModel):
+    id: str
+    conversation_id: int
+    role: str
+    content: str
+    audio_url: Optional[str] = None
+    audio_duration_ms: Optional[int] = None
+    expression: Optional[str] = None
+    created_at: str
+
+class SyncConversationResponse(BaseModel):
+    id: int
+    user_id: Optional[int] = None
+    device_id: Optional[str] = None
+    title: Optional[str] = None
+    source: str = 'text'
+    status: str = 'active'
+    messages: list[SyncMessageResponse] = []
+    created_at: str
+    updated_at: str
+    deleted_at: Optional[str] = None
+
+class ConversationRestoreResponse(BaseModel):
+    status: str
+    conversation_id: int

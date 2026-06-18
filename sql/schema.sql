@@ -61,8 +61,23 @@ CREATE TABLE IF NOT EXISTS conversations (
     user_id         INTEGER REFERENCES users(id),
     title           TEXT NOT NULL DEFAULT 'Nueva conversación',
     messages        TEXT NOT NULL DEFAULT '[]',
+    device_id       TEXT REFERENCES devices(serial_number),
+    source          TEXT NOT NULL DEFAULT 'text',
+    status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted', 'archived')),
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMP NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id              TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content         TEXT NOT NULL,
+    audio_url       TEXT,
+    audio_duration_ms INTEGER,
+    expression      TEXT,
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -88,4 +103,7 @@ CREATE INDEX IF NOT EXISTS idx_purchases_user    ON purchases(user_id);
 CREATE INDEX IF NOT EXISTS idx_devices_user      ON devices(user_id);
 CREATE INDEX IF NOT EXISTS idx_devices_serial    ON devices(serial_number);
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_device ON conversations(device_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_user_status ON conversations(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_conv_messages_conv ON conversation_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_user_date ON llm_usage(user_id, date);
