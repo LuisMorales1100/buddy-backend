@@ -1,4 +1,4 @@
--- Buddy Backend - PostgreSQL Schema
+-- Buddy Backend - PostgreSQL Schema (completo desde inicio)
 -- Safe to run on fresh DB — uses IF NOT EXISTS
 
 CREATE TABLE IF NOT EXISTS users (
@@ -14,16 +14,12 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS devices (
     id              SERIAL PRIMARY KEY,
-    serial_number   TEXT UNIQUE NOT NULL,
-    name            TEXT NOT NULL DEFAULT 'Buddy',
-    firmware_version TEXT NOT NULL DEFAULT '4.0',
-    mac_address     TEXT,
     user_id         INTEGER REFERENCES users(id),
-    paired_at       TIMESTAMP,
-    last_seen       TIMESTAMP,
-    is_online       INTEGER DEFAULT 0,
-    ip_address      TEXT,
-    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    serial          VARCHAR(255) UNIQUE NOT NULL,
+    name            VARCHAR(255),
+    last_known_ip   VARCHAR(255),
+    config          JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS firmware_releases (
@@ -57,16 +53,18 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
-    id              SERIAL PRIMARY KEY,
-    user_id         INTEGER REFERENCES users(id),
-    title           TEXT NOT NULL DEFAULT 'Nueva conversación',
-    messages        TEXT NOT NULL DEFAULT '[]',
-    device_id       TEXT REFERENCES devices(serial_number),
-    source          TEXT NOT NULL DEFAULT 'text',
-    status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted', 'archived')),
-    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at      TIMESTAMP NULL
+    id                  SERIAL PRIMARY KEY,
+    user_id             INTEGER REFERENCES users(id),
+    title               TEXT NOT NULL DEFAULT 'Nueva conversación',
+    origin_device_serial VARCHAR(255) NOT NULL DEFAULT 'app_general',
+    linked_device_serials JSONB NOT NULL DEFAULT '[]',
+    source              TEXT NOT NULL DEFAULT 'text',
+    status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted', 'archived')),
+    archived            BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at          TIMESTAMP NULL,
+    archived_at         TIMESTAMP NULL
 );
 
 CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -77,6 +75,7 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     audio_url       TEXT,
     audio_duration_ms INTEGER,
     expression      TEXT,
+    device_serial   VARCHAR(255),
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -101,9 +100,9 @@ CREATE TABLE IF NOT EXISTS animation_packs (
 CREATE INDEX IF NOT EXISTS idx_purchases_email   ON purchases(email);
 CREATE INDEX IF NOT EXISTS idx_purchases_user    ON purchases(user_id);
 CREATE INDEX IF NOT EXISTS idx_devices_user      ON devices(user_id);
-CREATE INDEX IF NOT EXISTS idx_devices_serial    ON devices(serial_number);
+CREATE INDEX IF NOT EXISTS idx_devices_serial    ON devices(serial);
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
-CREATE INDEX IF NOT EXISTS idx_conversations_device ON conversations(device_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_user_status ON conversations(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_conversations_archived ON conversations(archived);
 CREATE INDEX IF NOT EXISTS idx_conv_messages_conv ON conversation_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_user_date ON llm_usage(user_id, date);

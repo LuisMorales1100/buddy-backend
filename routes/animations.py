@@ -5,8 +5,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select
-from models.async_database import get_async_db, AnimationPackModel
-from models.database import ProductModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from models.async_database import get_async_db, get_session, AnimationPackModel
 from routes.auth import decode_token
 
 router = APIRouter(prefix="/animations", tags=["Animations"])
@@ -16,12 +16,13 @@ ANIMATIONS_DIR = pathlib.Path(__file__).parent.parent / "public" / "animations"
 EXPRESSIONS = ["idle", "talking", "happy", "think", "surprised", "sad", "angry"]
 
 
-def _get_user_animation_features(user_id):
+async def _get_user_animation_features(session: AsyncSession, user_id):
     """Get all animation feature IDs the user owns via their products."""
+    from models.async_database import product_get_user_products
     features = set()
     if not user_id:
         return features
-    products = ProductModel.get_user_products(user_id)
+    products = await product_get_user_products(session, user_id)
     for prod in products:
         anims = prod.get("features", {}).get("animations", [])
         features.update(anims)
@@ -50,14 +51,17 @@ async def _optional_user(authorization: Optional[str] = Header(None)):
 
 
 @router.get("/packs")
-async def list_packs(user: dict = Depends(_optional_user)):
+async def list_packs(
+    user: dict = Depends(_optional_user),
+    session: AsyncSession = Depends(get_session),
+):
     """List all animation packs with ownership info and 7 GIF URLs."""
-    async with get_async_db() as session:
-        result = await session.execute(select(AnimationPackModel).order_by(AnimationPackModel.id))
+    async with get_async_db() as db_session:
+        result = await db_session.execute(select(AnimationPackModel).order_by(AnimationPackModel.id))
         db_packs = result.scalars().all()
 
     user_id = user.get("user_id")
-    user_features = _get_user_animation_features(user_id) if user_id else set()
+    user_features = await _get_user_animation_features(session, user_id) if user_id else set()
 
     result = []
     for pack in db_packs:
@@ -80,9 +84,13 @@ async def list_packs(user: dict = Depends(_optional_user)):
 
 
 @router.get("/packs/{pack_id}")
-async def get_pack(pack_id: str, user: dict = Depends(_optional_user)):
-    async with get_async_db() as session:
-        result = await session.execute(
+async def get_pack(
+    pack_id: str,
+    user: dict = Depends(_optional_user),
+    session: AsyncSession = Depends(get_session),
+):
+    async with get_async_db() as db_session:
+        result = await db_session.execute(
             select(AnimationPackModel).where(AnimationPackModel.id == pack_id)
         )
         pack = result.scalar_one_or_none()
@@ -95,7 +103,8 @@ async def get_pack(pack_id: str, user: dict = Depends(_optional_user)):
     builtin = bool(pack.builtin)
     owned = free or builtin
     if not owned and user_id:
-        owned = pack_id in _get_user_animation_features(user_id)
+        user_features = await _get_user_animation_features(session, user_id)
+        owned = pack_id in user_features
 
     return {
         "id": pack_id,

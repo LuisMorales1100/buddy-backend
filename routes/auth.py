@@ -7,7 +7,9 @@ from fastapi import APIRouter, HTTPException, Header, Depends, Response, Request
 from pydantic import BaseModel
 from typing import Optional
 from jose import jwt as jose_jwt, JWTError
+from sqlalchemy.ext.asyncio import AsyncSession
 from services.limiter import limiter
+from models.async_database import get_session
 
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 REFRESH_SECRET = os.getenv("REFRESH_SECRET", "")
@@ -130,8 +132,6 @@ class PairDeviceRequest(BaseModel):
 class DeviceRegisterRequest(BaseModel):
     serial: str
     name: str = "Buddy"
-    firmware_version: str = "4.0"
-    mac: str = ""
 
 
 def hash_password(password: str) -> str:
@@ -227,6 +227,7 @@ def decode_token(token: str) -> Optional[dict]:
 async def get_current_user(
     request: Request,
     authorization: Optional[str] = Header(None),
+    session: AsyncSession = Depends(get_session),
 ):
     """Get current user from cookie (browser) or Authorization header (API/device)."""
     token = get_token_from_request(request, authorization)
@@ -235,23 +236,34 @@ async def get_current_user(
     payload = decode_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user_id = payload.get("user_id")
+    if user_id:
+        from models.async_database import user_get_by_id
+        db_user = await user_get_by_id(session, int(user_id))
+        if not db_user:
+            raise HTTPException(status_code=401, detail="User not found or invalid session")
     return payload
 
 
 # ===== Internal registration (webhook-only) =====
-def internal_register(email: str, name: str = "") -> Optional[int]:
-    from models.database import UserModel
-    return UserModel.create(email, "", name)
+async def internal_register(session: AsyncSession, email: str, name: str = "") -> Optional[int]:
+    from models.async_database import user_create
+    return await user_create(session, email, "", name)
 
 
 # ===== Routes =====
 
 @router.post("/auth/login")
 @limiter.limit("10/minute")
-async def login(request: Request, req: LoginRequest, response: Response):
-    from models.database import UserModel, PurchaseModel, ProductModel
+async def login(
+    request: Request, req: LoginRequest, response: Response,
+    session: AsyncSession = Depends(get_session),
+):
+    from models.async_database import (
+        user_get_by_email, purchase_link_to_user, purchase_user_has_purchase, product_get_user_products,
+    )
 
-    user = UserModel.get_by_email(req.email)
+    user = await user_get_by_email(session, req.email)
     if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Email o contraseña incorrectos")
 
@@ -261,8 +273,8 @@ async def login(request: Request, req: LoginRequest, response: Response):
             detail="Debés configurar tu contraseña primero. Revisá tu email.",
         )
 
-    PurchaseModel.link_to_user(req.email, user["id"])
-    has_purchase = PurchaseModel.user_has_purchase(user["id"])
+    await purchase_link_to_user(session, req.email, user["id"])
+    has_purchase = await purchase_user_has_purchase(session, user["id"])
 
     if not has_purchase:
         raise HTTPException(
@@ -270,7 +282,7 @@ async def login(request: Request, req: LoginRequest, response: Response):
             detail="Necesitás una compra verificada de Buddy para acceder.",
         )
 
-    products = ProductModel.get_user_products(user["id"])
+    products = await product_get_user_products(session, user["id"])
 
     payload = {"user_id": user["id"], "email": user["email"], "role": "user"}
     access_token = create_access_token(payload)
@@ -291,8 +303,11 @@ async def login(request: Request, req: LoginRequest, response: Response):
 
 
 @router.post("/auth/set-password")
-async def set_password(req: SetPasswordRequest):
-    from models.database import UserModel
+async def set_password(
+    req: SetPasswordRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    from models.async_database import user_get_by_email, user_set_password
 
     expected = hashlib.sha256((req.email + JWT_SECRET).encode()).hexdigest()[:12]
     if req.code != expected:
@@ -301,11 +316,11 @@ async def set_password(req: SetPasswordRequest):
     if len(req.password) < 6:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
 
-    user = UserModel.get_by_email(req.email)
+    user = await user_get_by_email(session, req.email)
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
-    UserModel.set_password(user["id"], hash_password(req.password))
+    await user_set_password(session, user["id"], hash_password(req.password))
 
     return {"status": "ok", "message": "Contraseña configurada. Ya podés iniciar sesión."}
 
@@ -342,16 +357,21 @@ async def logout(response: Response):
 
 
 @router.get("/auth/me")
-async def me(user: dict = Depends(get_current_user)):
-    from models.database import UserModel, DeviceModel, PurchaseModel, ProductModel
+async def me(
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    from models.async_database import (
+        user_get_by_id, device_get_user_devices, purchase_user_has_purchase, product_get_user_products,
+    )
 
-    db_user = UserModel.get_by_id(user["user_id"])
+    db_user = await user_get_by_id(session, user["user_id"])
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    devices = DeviceModel.get_user_devices(user["user_id"])
-    has_purchase = PurchaseModel.user_has_purchase(user["user_id"])
-    products = ProductModel.get_user_products(user["user_id"]) if has_purchase else []
+    devices = await device_get_user_devices(session, user["user_id"])
+    has_purchase = await purchase_user_has_purchase(session, user["user_id"])
+    products = await product_get_user_products(session, user["user_id"]) if has_purchase else []
 
     return {
         "user_id": db_user["id"],
@@ -365,11 +385,13 @@ async def me(user: dict = Depends(get_current_user)):
 
 
 @router.post("/devices/register")
-async def register_device(req: DeviceRegisterRequest):
-    from models.database import DeviceModel
+async def register_device(
+    req: DeviceRegisterRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    from models.async_database import device_upsert
 
-    DeviceModel.register(req.serial, req.name, req.firmware_version, req.mac)
-    DeviceModel.update_last_seen(req.serial, "", online=True)
+    await device_upsert(session, serial=req.serial, name=req.name)
 
     token = create_access_token(
         {"serial": req.serial, "role": "device"}
@@ -383,20 +405,13 @@ async def register_device(req: DeviceRegisterRequest):
 
 @router.post("/devices/pair")
 async def pair_device(
-    req: PairDeviceRequest, user: dict = Depends(get_current_user)
+    req: PairDeviceRequest, user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ):
-    from models.database import DeviceModel
+    from models.async_database import device_upsert
 
-    DeviceModel.pair(req.serial, user["user_id"])
+    await device_upsert(session, serial=req.serial, user_id=user["user_id"], name=req.name)
     return {"status": "paired", "serial": req.serial, "user_id": user["user_id"]}
-
-
-@router.get("/devices")
-async def list_devices(user: dict = Depends(get_current_user)):
-    from models.database import DeviceModel
-
-    devices = DeviceModel.get_user_devices(user["user_id"])
-    return {"devices": devices}
 
 
 @router.post("/devices/heartbeat")
@@ -404,10 +419,9 @@ async def device_heartbeat(
     serial: str = Header(...),
     ip: str = Header(""),
     fw_version: str = Header(""),
+    session: AsyncSession = Depends(get_session),
 ):
-    from models.database import DeviceModel
+    from models.async_database import device_upsert
 
-    DeviceModel.update_last_seen(serial, ip)
-    if fw_version:
-        DeviceModel.set_firmware_version(serial, fw_version)
+    await device_upsert(session, serial=serial, last_known_ip=ip or None)
     return {"status": "ok"}
