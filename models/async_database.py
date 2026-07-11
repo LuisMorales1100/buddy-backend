@@ -182,6 +182,19 @@ def _orm_to_dict(instance) -> dict:
     return {c.name: getattr(instance, c.name) for c in instance.__table__.columns}
 
 
+def _deep_merge(target: dict, source: dict) -> dict:
+    """Recursively merge source into target. Returns new dict; does not mutate inputs."""
+    if not isinstance(source, dict):
+        # Si source no es dict, no hay nada que mergear — devolver target tal cual
+        return dict(target)
+    result = dict(target)
+    for key, value in source.items():
+        if isinstance(value, dict) and key in result and isinstance(result[key], dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
 async def user_create(session: AsyncSession, email: str, password_hash: str, name: str = ""):
     user = UserModel(email=email, password_hash=password_hash, name=name)
     session.add(user)
@@ -247,9 +260,10 @@ async def device_upsert(session: AsyncSession, serial: str, user_id: int | None 
         if user_id is not None:
             device.user_id = user_id
         if config is not None:
+            # FIX: deep merge instead of shallow update to prevent nested data loss
             current = dict(device.config or {})
-            current.update(config)
-            device.config = current
+            merged = _deep_merge(current, config)
+            device.config = merged
     else:
         if last_known_ip and user_id:
             by_ip = await session.execute(
@@ -266,9 +280,10 @@ async def device_upsert(session: AsyncSession, serial: str, user_id: int | None 
             if last_known_ip is not None:
                 device.last_known_ip = last_known_ip
             if config is not None:
+                # FIX: deep merge instead of shallow update
                 current = dict(device.config or {})
-                current.update(config)
-                device.config = current
+                merged = _deep_merge(current, config)
+                device.config = merged
         else:
             device = DeviceModel(
                 serial=serial,
