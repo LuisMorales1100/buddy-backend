@@ -16,6 +16,8 @@ from faster_whisper import WhisperModel
 import edge_tts
 from pydub import AudioSegment
 import miniaudio
+import re
+import uuid
 
 from models.async_database import get_session, DeviceModel, ConversationModel, ConversationMessageModel
 
@@ -24,6 +26,7 @@ router = APIRouter(prefix="/voice", tags=["Voice"])
 
 LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "http://localhost:3100/v1/llm/chat")
 OLLAMA_ENDPOINT = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/chat")
+MAX_VOICE_MESSAGES = 50
 
 _whisper_model = None
 
@@ -38,7 +41,7 @@ class VoiceChatRequest(BaseModel):
     audio: str
     serial: str
     language: str = "es-ES"
-
+    wake_word: Optional[str] = None
 
 class VoiceChatResponse(BaseModel):
     text: str
@@ -199,21 +202,15 @@ def _mp3_to_pcm16k(mp3_bytes: bytes) -> bytes:
     return decoded.samples
 
 
-async def _save_voice_conversation(session: AsyncSession, serial: str, user_text: str, bot_text: str):
-    import uuid
-    
-    # FIX: Sanitizar serial
+async def _save_voice_conversation(session: AsyncSession, serial: str, user_text: str, bot_text: str, audio_b64: str = None, audio_duration_ms: int = None):
     serial_clean = serial.strip().strip('"').strip("'").replace('\x00', '')
     
-    # FIX: Query con log detallado de diagnóstico
     result = await session.execute(
         select(DeviceModel).where(DeviceModel.serial == serial_clean)
     )
     device = result.scalar_one_or_none()
     
-    # FIX: Log exhaustivo para debugging
     if device is None:
-        # Intentar encontrar por LIKE como fallback de diagnóstico
         fallback = await session.execute(
             select(DeviceModel).where(DeviceModel.serial.ilike(f"%{serial_clean}%"))
         )
@@ -225,9 +222,8 @@ async def _save_voice_conversation(session: AsyncSession, serial: str, user_text
             serial_hex=serial_clean.encode('utf-8').hex(),
             serial_len=len(serial_clean),
             similar_devices=[d.serial for d in similar],
-            hint="Exact serial match failed. Check for encoding issues or DB mismatch."
         )
-        return None  # No guardar si no hay device
+        return None
     
     if not device.user_id:
         log.error(
@@ -249,58 +245,90 @@ async def _save_voice_conversation(session: AsyncSession, serial: str, user_text
     
     now = datetime.utcnow()
     
-    # Buscar conversación activa reciente de ESTE device
+    # Buscar conversación activa de voz de ESTE device que NO haya alcanzado el límite.
     result = await session.execute(
         select(ConversationModel).where(
             ConversationModel.origin_device_serial == serial_clean,
+            ConversationModel.source == "voice",
             ConversationModel.status == "active",
         ).order_by(ConversationModel.updated_at.desc()).limit(1)
     )
     conv = result.scalar_one_or_none()
     
+    # Si existe, contar mensajes. Si al agregar 2 más se excede el límite, crear nueva.
+    if conv:
+        msg_count_result = await session.execute(
+            select(ConversationMessageModel).where(
+                ConversationMessageModel.conversation_id == conv.id
+            )
+        )
+        msg_count = len(msg_count_result.scalars().all())
+        
+        if msg_count + 2 > MAX_VOICE_MESSAGES:
+            log.info(
+                "voice.conv_limit_reached",
+                conversation_id=conv.id,
+                msg_count=msg_count,
+                max=MAX_VOICE_MESSAGES,
+                serial=serial_clean
+            )
+            conv = None
+    
+    # Crear nueva conversación si no hay activa o se alcanzó el límite.
     if not conv:
         conv = ConversationModel(
-            user_id=device.user_id,  # ← SIEMPRE vinculado al user del device
-            title=user_text[:80] if user_text else "Voice conversation",
+            user_id=device.user_id,
+            title="Nueva conversación",
             origin_device_serial=serial_clean,
             linked_device_serials=[serial_clean],
             source="voice",
             status="active",
-            created_at=now, 
+            created_at=now,
             updated_at=now,
         )
         session.add(conv)
-        await session.flush()  # Obtener conv.id sin commit
+        await session.flush()
+        log.info(
+            "voice.new_conversation_created",
+            conversation_id=conv.id,
+            serial=serial_clean,
+            reason="no_active_voice_conv_or_limit_reached"
+        )
     
     user_msg = ConversationMessageModel(
-        id=str(uuid.uuid4()), 
+        id=str(uuid.uuid4()),
         conversation_id=conv.id,
-        role="user", 
-        content=user_text, 
-        device_serial=serial_clean, 
+        role="user",
+        content=user_text,
+        audio_url=audio_b64 if audio_b64 else None,
+        audio_duration_ms=audio_duration_ms if audio_duration_ms else None,
+        device_serial=serial_clean,
         created_at=now,
     )
     session.add(user_msg)
     
     bot_msg = ConversationMessageModel(
-        id=str(uuid.uuid4()), 
+        id=str(uuid.uuid4()),
         conversation_id=conv.id,
-        role="assistant", 
-        content=bot_text, 
-        device_serial=serial_clean, 
+        role="assistant",
+        content=bot_text,
+        audio_url=audio_b64 if audio_b64 else None,
+        audio_duration_ms=audio_duration_ms if audio_duration_ms else None,
+        device_serial=serial_clean,
         created_at=now,
     )
     session.add(bot_msg)
     
     conv.updated_at = now
-    # FIX: NO hacer commit aquí — dejar que get_session() maneje la transacción
-    # El commit final del endpoint persiste todo atomically
+    await session.commit()
     
     log.info(
         "voice.conversation_saved",
         serial=serial_clean,
         conversation_id=conv.id,
-        user_id=device.user_id
+        user_id=device.user_id,
+        has_audio=bool(audio_b64),
+        audio_duration_ms=audio_duration_ms
     )
     return conv.id
 
@@ -325,23 +353,40 @@ async def voice_chat(
         raise HTTPException(status_code=400, detail="Audio too short")
 
     lang = request.language or "es-ES"
-    log.info("voice.chat.start", serial=serial_clean, size=len(audio_bytes), lang=lang)
+    log.info("voice.chat.start", serial=serial_clean, size=len(audio_bytes), lang=lang, wake_word=request.wake_word)
 
     transcribed = await _whisper_stt(audio_bytes, lang)
     log.info("voice.stt.done", text=transcribed[:100])
 
-    # FIX: Si no hay speech, no devolver 400. En su lugar, generar una respuesta
-    # TTS amigable para que el ESP32 reproduzca algo y el usuario sepa que
-    # el sistema está vivo pero no lo escuchó.
+    # FIX: Validación de Wake Word Dinámica
+    if request.wake_word:
+        ww = request.wake_word.lower().strip()
+        transcribed_lower = transcribed.lower().strip()
+        
+        # FIX: Si no hay transcripción, es "no speech", no "wake word mismatch"
+        if not transcribed_lower:
+            log.info("voice.no_speech_after_wake", expected=ww)
+            return VoiceChatResponse(text="", audio="")
+        
+        if ww and ww not in transcribed_lower:
+            log.info("voice.wake_word_mismatch", expected=ww, got=transcribed_lower)
+            return VoiceChatResponse(text="", audio="")
+        
+        # Extraer comando removiendo wake word
+        pattern = re.compile(re.escape(ww), re.IGNORECASE)
+        actual_command = pattern.sub('', transcribed, count=1).strip()
+        
+        if not actual_command:
+            log.info("voice.wake_word_only", text=transcribed)
+            return VoiceChatResponse(text="", audio="")
+            
+        transcribed = actual_command
+
     if not transcribed.strip():
         log.warn("voice.no_speech_detected", serial=serial_clean)
         friendly_retry = {
             "es": "No te escuché bien. ¿Puedes repetirlo, por favor?",
             "en": "I didn't catch that. Could you please repeat?",
-            "fr": "Je ne vous ai pas bien entendu. Pouvez-vous répéter?",
-            "de": "Ich habe Sie nicht gut verstanden. Können Sie das wiederholen?",
-            "pt": "Não te ouvi bem. Podes repetir, por favor?",
-            "it": "Non ti ho sentito bene. Puoi ripetere, per favore?",
         }
         short = _iso_to_short(lang)
         retry_text = friendly_retry.get(short, friendly_retry["es"])
@@ -350,7 +395,6 @@ async def voice_chat(
         pcm_16k = _mp3_to_pcm16k(tts_mp3)
         #_debug_dump_wav(pcm_16k, "retry")  # FIX: temporal, quitar después de diagnosticar
         audio_b64 = base64.b64encode(pcm_16k).decode()
-        
         return VoiceChatResponse(text=retry_text, audio=audio_b64)
 
     llm_response = await _call_llm(transcribed, lang)
@@ -361,7 +405,8 @@ async def voice_chat(
     #_debug_dump_wav(pcm_16k, "response")  # FIX: temporal, quitar después de diagnosticar
     audio_b64 = base64.b64encode(pcm_16k).decode()
 
-    conv_id = await _save_voice_conversation(session, serial_clean, transcribed, llm_response)
+    audio_duration_ms = int((len(pcm_16k) / 32000) * 1000) if pcm_16k else None
+    conv_id = await _save_voice_conversation(session, serial_clean, transcribed, llm_response, audio_b64, audio_duration_ms)
     if conv_id is None:
         log.warn("voice.conversation_not_saved_but_audio_returned", serial=serial_clean)
     
