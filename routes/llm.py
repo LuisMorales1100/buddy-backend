@@ -7,6 +7,9 @@ from fastapi.responses import StreamingResponse
 from models.schemas import LLMRequest, LLMResponse
 from routes.auth import decode_token
 from typing import Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from models.async_database import get_session
+from models.async_database import usage_can_make_request, purchase_user_has_purchase, usage_increment
 
 log = structlog.get_logger()
 
@@ -54,11 +57,9 @@ async def get_llm_auth(authorization: Optional[str] = Header(None)):
     return {"role": "anonymous", "serial": "unknown"}
 
 
-def _usage_check(request: LLMRequest, auth: dict):
+async def _usage_check(request: LLMRequest, auth: dict, session: AsyncSession):
     if len(request.messages) > 20:
         raise HTTPException(status_code=400, detail="Demasiados mensajes en la solicitud (máx. 20)")
-
-    from models.database import PurchaseModel, UsageModel
 
     user_id = auth.get("user_id")
     role = auth.get("role", "anonymous")
@@ -69,9 +70,9 @@ def _usage_check(request: LLMRequest, auth: dict):
             detail="Debes iniciar sesión con una cuenta que haya comprado Buddy para usar Buddy Cloud LLM.",
         )
 
-    can_request, msg = UsageModel.can_make_request(user_id)
+    can_request, msg = await usage_can_make_request(session, user_id)
     if not can_request:
-        has_purchase = PurchaseModel.user_has_purchase(user_id)
+        has_purchase = await purchase_user_has_purchase(session, user_id)
         limit_msg = (
             "Has alcanzado el límite diario de Buddy Cloud. Vuelve mañana."
             if has_purchase
@@ -80,20 +81,23 @@ def _usage_check(request: LLMRequest, auth: dict):
         raise HTTPException(status_code=429, detail=limit_msg)
 
     if request.provider == "buddy_cloud":
-        has_purchase = PurchaseModel.user_has_purchase(user_id)
+        has_purchase = await purchase_user_has_purchase(session, user_id)
         if not has_purchase:
             raise HTTPException(
                 status_code=402,
                 detail="Necesitás una compra verificada de Buddy para usar nuestro modelo. Iniciá sesión con el email que usaste al comprar.",
             )
 
-    UsageModel.increment(user_id)
+    await usage_increment(session, user_id)
 
 
 @router.post("/chat", response_model=LLMResponse)
-async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
+async def chat(
+    request: LLMRequest, auth=Depends(get_llm_auth),
+    session: AsyncSession = Depends(get_session),
+):
     log.info("chat.request", provider=request.provider, prompt=request.messages[-1].content[:80] if request.messages else "", user_id=auth.get("user_id"))
-    _usage_check(request, auth)
+    await _usage_check(request, auth, session)
 
     if BUDDY_CLOUD_URL and request.provider == "buddy_cloud":
         return await proxy_buddy_cloud(request)
@@ -143,9 +147,12 @@ async def chat(request: LLMRequest, auth=Depends(get_llm_auth)):
 
 
 @router.post("/chat/stream")
-async def chat_stream(request: LLMRequest, request_obj: Request, auth=Depends(get_llm_auth)):
+async def chat_stream(
+    request: LLMRequest, request_obj: Request, auth=Depends(get_llm_auth),
+    session: AsyncSession = Depends(get_session),
+):
     log.info("chat.stream_request", provider=request.provider, prompt=request.messages[-1].content[:80] if request.messages else "", user_id=auth.get("user_id"))
-    _usage_check(request, auth)
+    await _usage_check(request, auth, session)
 
     if request.provider != "buddy_cloud" or not BUDDY_CLOUD_URL:
         raise HTTPException(status_code=400, detail="Streaming solo disponible para Buddy Cloud")
