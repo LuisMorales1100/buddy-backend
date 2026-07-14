@@ -423,6 +423,34 @@ async def product_get_user_products(session: AsyncSession, user_id: int):
     return products
 
 
+async def conversation_get_messages(session: AsyncSession, conversation_id: int, user_id: int, limit: int = 10):
+    """Recupera los últimos N mensajes de una conversación en orden cronológico.
+    Verifica que el usuario sea el dueño antes de devolver datos."""
+    from sqlalchemy import select
+
+    # Ownership check
+    conv_result = await session.execute(
+        select(ConversationModel).where(
+            ConversationModel.id == conversation_id,
+            ConversationModel.user_id == user_id,
+        )
+    )
+    if not conv_result.scalar_one_or_none():
+        return []
+
+    result = await session.execute(
+        select(ConversationMessageModel)
+        .where(ConversationMessageModel.conversation_id == conversation_id)
+        .order_by(ConversationMessageModel.created_at.desc())
+        .limit(limit)
+    )
+    rows = result.scalars().all()
+    return [
+        {"role": r.role, "content": r.content}
+        for r in reversed(rows)
+    ]
+
+
 @asynccontextmanager
 async def get_async_db():
     async with AsyncSessionLocal() as session:

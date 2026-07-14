@@ -93,6 +93,7 @@ class LLMRequest(BaseModel):
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
     agent_id: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 class LLMResponse(BaseModel):
     text: str

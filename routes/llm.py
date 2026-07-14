@@ -4,11 +4,11 @@ import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse
-from models.schemas import LLMRequest, LLMResponse
+from models.schemas import LLMRequest, LLMResponse, ChatMessage
 from routes.auth import decode_token
-from typing import Optional
+from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from models.async_database import get_session
+from models.async_database import get_session, conversation_get_messages
 from models.async_database import usage_can_make_request, purchase_user_has_purchase, usage_increment
 
 log = structlog.get_logger()
@@ -91,6 +91,45 @@ async def _usage_check(request: LLMRequest, auth: dict, session: AsyncSession):
     await usage_increment(session, user_id)
 
 
+async def _inject_history(request: LLMRequest, session: AsyncSession, auth: dict) -> LLMRequest:
+    """Prepend mensajes históricos de PostgreSQL al request actual.
+    Solo agrega mensajes que NO estén ya presentes en el request del frontend."""
+    conv_id = getattr(request, "conversation_id", None)
+    if not conv_id:
+        return request
+
+    try:
+        conv_id_int = int(conv_id)
+    except (ValueError, TypeError):
+        return request
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        return request
+
+    # Traer últimos 10 mensajes históricos (verifica ownership)
+    history = await conversation_get_messages(session, conv_id_int, user_id, limit=10)
+
+    # Separar system prompt del request actual
+    system_msg = next((m for m in request.messages if m.role == "system"), None)
+    current_msgs = [m for m in request.messages if m.role != "system"]
+
+    # Construir set de (role, content) ya presentes en el request
+    existing = {(m.role, m.content) for m in current_msgs}
+
+    # Filtrar history: solo mensajes que NO estén ya en current_msgs
+    history_new = [h for h in history if (h["role"], h["content"]) not in existing]
+
+    new_messages: List[ChatMessage] = []
+    if system_msg:
+        new_messages.append(system_msg)
+    for h in history_new:
+        new_messages.append(ChatMessage(role=h["role"], content=h["content"]))
+    new_messages.extend(current_msgs)
+
+    return request.model_copy(update={"messages": new_messages})
+
+
 @router.post("/chat", response_model=LLMResponse)
 async def chat(
     request: LLMRequest, auth=Depends(get_llm_auth),
@@ -98,6 +137,9 @@ async def chat(
 ):
     log.info("chat.request", provider=request.provider, prompt=request.messages[-1].content[:80] if request.messages else "", user_id=auth.get("user_id"))
     await _usage_check(request, auth, session)
+
+    # FASE 1: Inyectar historial de conversación desde PostgreSQL
+    request = await _inject_history(request, session, auth)
 
     if BUDDY_CLOUD_URL and request.provider == "buddy_cloud":
         return await proxy_buddy_cloud(request)
@@ -154,6 +196,9 @@ async def chat_stream(
     log.info("chat.stream_request", provider=request.provider, prompt=request.messages[-1].content[:80] if request.messages else "", user_id=auth.get("user_id"))
     await _usage_check(request, auth, session)
 
+    # FASE 1: Inyectar historial de conversación desde PostgreSQL
+    request = await _inject_history(request, session, auth)
+
     if request.provider != "buddy_cloud" or not BUDDY_CLOUD_URL:
         raise HTTPException(status_code=400, detail="Streaming solo disponible para Buddy Cloud")
 
@@ -178,6 +223,7 @@ async def proxy_buddy_cloud_stream(request: LLMRequest):
                     "messages": messages,
                     "temperature": request.temperature,
                     "agent_id": request.agent_id,
+                    "conversation_id": request.conversation_id,
                 },
             ) as resp:
                 if resp.status_code != 200:
@@ -337,6 +383,7 @@ async def proxy_buddy_cloud(request: LLMRequest) -> LLMResponse:
                 "messages": messages,
                 "temperature": request.temperature,
                 "agent_id": request.agent_id,
+                "conversation_id": request.conversation_id,
             },
         )
         if res.status_code != 200:
