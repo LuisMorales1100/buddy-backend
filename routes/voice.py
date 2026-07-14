@@ -42,10 +42,12 @@ class VoiceChatRequest(BaseModel):
     serial: str
     language: str = "es-ES"
     wake_word: Optional[str] = None
+    conversation_id: Optional[int] = None  # FIX: ESP32 envía la conv asignada
 
 class VoiceChatResponse(BaseModel):
     text: str
     audio: str
+    conversation_id: Optional[int] = None  # FIX: Devolver al ESP32 para sincronización
 
 def _debug_dump_wav(pcm_16k: bytes, tag: str = "debug"):
     """FIX temporal de diagnóstico: vuelca el PCM final (antes de base64) a un
@@ -202,7 +204,7 @@ def _mp3_to_pcm16k(mp3_bytes: bytes) -> bytes:
     return decoded.samples
 
 
-async def _save_voice_conversation(session: AsyncSession, serial: str, user_text: str, bot_text: str, audio_b64: str = None, audio_duration_ms: int = None):
+async def _save_voice_conversation(session: AsyncSession, serial: str, user_text: str, bot_text: str, audio_b64: str = None, audio_duration_ms: int = None, conversation_id: Optional[int] = None):
     serial_clean = serial.strip().strip('"').strip("'").replace('\x00', '')
     
     result = await session.execute(
@@ -245,36 +247,73 @@ async def _save_voice_conversation(session: AsyncSession, serial: str, user_text
     
     now = datetime.utcnow()
     
-    # Buscar conversación activa de voz de ESTE device que NO haya alcanzado el límite.
-    result = await session.execute(
-        select(ConversationModel).where(
-            ConversationModel.origin_device_serial == serial_clean,
-            ConversationModel.source == "voice",
-            ConversationModel.status == "active",
-        ).order_by(ConversationModel.updated_at.desc()).limit(1)
-    )
-    conv = result.scalar_one_or_none()
-    
-    # Si existe, contar mensajes. Si al agregar 2 más se excede el límite, crear nueva.
-    if conv:
-        msg_count_result = await session.execute(
-            select(ConversationMessageModel).where(
-                ConversationMessageModel.conversation_id == conv.id
-            )
+    # FIX: Si el ESP32 envió conversation_id, verificar que sea válida y del mismo dispositivo.
+    target_conv = None
+    if conversation_id:
+        result = await session.execute(
+            select(ConversationModel).where(
+                ConversationModel.id == conversation_id,
+                ConversationModel.status == "active",
+            ).order_by(ConversationModel.updated_at.desc()).limit(1)
         )
-        msg_count = len(msg_count_result.scalars().all())
+        target_conv = result.scalar_one_or_none()
         
-        if msg_count + 2 > MAX_VOICE_MESSAGES:
-            log.info(
-                "voice.conv_limit_reached",
-                conversation_id=conv.id,
-                msg_count=msg_count,
-                max=MAX_VOICE_MESSAGES,
-                serial=serial_clean
+        if target_conv:
+            # Verificar que el dispositivo esté vinculado (origin o linked)
+            linked = list(target_conv.linked_device_serials or [])
+            is_linked = (
+                target_conv.origin_device_serial == serial_clean or
+                serial_clean in linked
             )
-            conv = None
+            if not is_linked:
+                log.warn(
+                    "voice.conversation_not_linked",
+                    conversation_id=conversation_id,
+                    serial=serial_clean,
+                    origin=target_conv.origin_device_serial,
+                    linked=linked,
+                )
+                target_conv = None
+            else:
+                # Verificar que no esté llena
+                msg_count_result = await session.execute(
+                    select(ConversationMessageModel).where(
+                        ConversationMessageModel.conversation_id == target_conv.id
+                    )
+                )
+                msg_count = len(msg_count_result.scalars().all())
+                if msg_count + 2 > MAX_VOICE_MESSAGES:
+                    log.info(
+                        "voice.assigned_conv_full",
+                        conversation_id=conversation_id,
+                        msg_count=msg_count,
+                        max=MAX_VOICE_MESSAGES,
+                    )
+                    target_conv = None  # Forzar creación de nueva
     
-    # Crear nueva conversación si no hay activa o se alcanzó el límite.
+    # Si hay target_conv válida, usarla. Si no, buscar la más reciente de voz.
+    conv = target_conv
+    if not conv:
+        result = await session.execute(
+            select(ConversationModel).where(
+                ConversationModel.origin_device_serial == serial_clean,
+                ConversationModel.source == "voice",
+                ConversationModel.status == "active",
+            ).order_by(ConversationModel.updated_at.desc()).limit(1)
+        )
+        conv = result.scalar_one_or_none()
+        
+        if conv:
+            msg_count_result = await session.execute(
+                select(ConversationMessageModel).where(
+                    ConversationMessageModel.conversation_id == conv.id
+                )
+            )
+            msg_count = len(msg_count_result.scalars().all())
+            if msg_count + 2 > MAX_VOICE_MESSAGES:
+                conv = None
+    
+    # Crear nueva si no hay válida
     if not conv:
         conv = ConversationModel(
             user_id=device.user_id,
@@ -322,6 +361,24 @@ async def _save_voice_conversation(session: AsyncSession, serial: str, user_text
     conv.updated_at = now
     await session.commit()
     
+    # FIX: Actualizar active_conversation_id en DeviceConfig del dispositivo
+    # Solo si cambió (nueva conv creada o asignada diferente)
+    device_config = device.config or {}
+    current_active = device_config.get("active_conversation_id")
+    new_active = conv.id
+    
+    if current_active != new_active:
+        device_config["active_conversation_id"] = new_active
+        device.config = device_config
+        # Necesitamos un commit adicional para guardar config
+        await session.commit()
+        log.info(
+            "voice.device_config_updated",
+            serial=serial_clean,
+            old_conversation_id=current_active,
+            new_conversation_id=new_active,
+        )
+    
     log.info(
         "voice.conversation_saved",
         serial=serial_clean,
@@ -353,7 +410,7 @@ async def voice_chat(
         raise HTTPException(status_code=400, detail="Audio too short")
 
     lang = request.language or "es-ES"
-    log.info("voice.chat.start", serial=serial_clean, size=len(audio_bytes), lang=lang, wake_word=request.wake_word)
+    log.info("voice.chat.start", serial=serial_clean, size=len(audio_bytes), lang=lang, wake_word=request.wake_word, conversation_id=request.conversation_id)
 
     transcribed = await _whisper_stt(audio_bytes, lang)
     log.info("voice.stt.done", text=transcribed[:100])
@@ -366,11 +423,11 @@ async def voice_chat(
         # FIX: Si no hay transcripción, es "no speech", no "wake word mismatch"
         if not transcribed_lower:
             log.info("voice.no_speech_after_wake", expected=ww)
-            return VoiceChatResponse(text="", audio="")
+            return VoiceChatResponse(text="", audio="", conversation_id=None)
         
         if ww and ww not in transcribed_lower:
             log.info("voice.wake_word_mismatch", expected=ww, got=transcribed_lower)
-            return VoiceChatResponse(text="", audio="")
+            return VoiceChatResponse(text="", audio="", conversation_id=None)
         
         # Extraer comando removiendo wake word
         pattern = re.compile(re.escape(ww), re.IGNORECASE)
@@ -378,7 +435,7 @@ async def voice_chat(
         
         if not actual_command:
             log.info("voice.wake_word_only", text=transcribed)
-            return VoiceChatResponse(text="", audio="")
+            return VoiceChatResponse(text="", audio="", conversation_id=None)
             
         transcribed = actual_command
 
@@ -393,21 +450,33 @@ async def voice_chat(
         
         tts_mp3 = await _edge_tts(retry_text, lang)
         pcm_16k = _mp3_to_pcm16k(tts_mp3)
-        #_debug_dump_wav(pcm_16k, "retry")  # FIX: temporal, quitar después de diagnosticar
         audio_b64 = base64.b64encode(pcm_16k).decode()
-        return VoiceChatResponse(text=retry_text, audio=audio_b64)
+        
+        # FIX: Guardar el mensaje de retry en conversación real para trazabilidad
+        audio_duration_ms = int((len(pcm_16k) / 32000) * 1000) if pcm_16k else None
+        conv_id = await _save_voice_conversation(
+            session, serial_clean, "[no speech detected]", retry_text, 
+            audio_b64, audio_duration_ms, request.conversation_id
+        )
+        if conv_id is None:
+            log.warn("voice.retry_conversation_not_saved", serial=serial_clean)
+        
+        return VoiceChatResponse(text=retry_text, audio=audio_b64, conversation_id=conv_id)
 
     llm_response = await _call_llm(transcribed, lang)
     log.info("voice.llm.done", text=llm_response[:100])
 
     tts_mp3 = await _edge_tts(llm_response, lang)
     pcm_16k = _mp3_to_pcm16k(tts_mp3)
-    #_debug_dump_wav(pcm_16k, "response")  # FIX: temporal, quitar después de diagnosticar
     audio_b64 = base64.b64encode(pcm_16k).decode()
 
     audio_duration_ms = int((len(pcm_16k) / 32000) * 1000) if pcm_16k else None
-    conv_id = await _save_voice_conversation(session, serial_clean, transcribed, llm_response, audio_b64, audio_duration_ms)
+    conv_id = await _save_voice_conversation(
+        session, serial_clean, transcribed, llm_response, 
+        audio_b64, audio_duration_ms, request.conversation_id
+    )
     if conv_id is None:
         log.warn("voice.conversation_not_saved_but_audio_returned", serial=serial_clean)
     
-    return VoiceChatResponse(text=llm_response, audio=audio_b64)
+    # FIX: Devolver conversation_id para que el ESP32 sincronice su config
+    return VoiceChatResponse(text=llm_response, audio=audio_b64, conversation_id=conv_id)
