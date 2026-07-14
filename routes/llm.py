@@ -177,6 +177,7 @@ async def proxy_buddy_cloud_stream(request: LLMRequest):
                     "model": request.model or "buddy-llm",
                     "messages": messages,
                     "temperature": request.temperature,
+                    "agent_id": request.agent_id,
                 },
             ) as resp:
                 if resp.status_code != 200:
@@ -335,6 +336,7 @@ async def proxy_buddy_cloud(request: LLMRequest) -> LLMResponse:
                 "model": request.model or "buddy-llm",
                 "messages": messages,
                 "temperature": request.temperature,
+                "agent_id": request.agent_id,
             },
         )
         if res.status_code != 200:

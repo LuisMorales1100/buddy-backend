@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     audio_duration_ms INTEGER,
     expression      TEXT,
     device_serial   VARCHAR(255),
+    agent_id        VARCHAR(255),
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

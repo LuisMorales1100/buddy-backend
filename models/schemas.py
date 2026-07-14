@@ -92,6 +92,7 @@ class LLMRequest(BaseModel):
     stream: bool = False
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
+    agent_id: Optional[str] = None
 
 class LLMResponse(BaseModel):
     text: str
@@ -157,6 +158,7 @@ class SyncMessageCreate(BaseModel):
     audio_url: Optional[str] = None
     audio_duration_ms: Optional[int] = None
     expression: Optional[str] = None
+    agent_id: Optional[str] = None
 
 class SyncConversationCreate(BaseModel):
     title: Optional[str] = None
@@ -171,6 +173,7 @@ class SyncMessageResponse(BaseModel):
     audio_url: Optional[str] = None
     audio_duration_ms: Optional[int] = None
     expression: Optional[str] = None
+    agent_id: Optional[str] = None
     created_at: str
 
 class SyncConversationResponse(BaseModel):

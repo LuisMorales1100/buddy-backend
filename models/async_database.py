@@ -113,6 +113,7 @@ class ConversationMessageModel(Base):
     audio_duration_ms = Column(Integer, nullable=True)
     expression = Column(String, nullable=True)
     device_serial = Column(String, nullable=True)
+    agent_id = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     conversation = relationship("ConversationModel", back_populates="messages_rel")
 

@@ -22,6 +22,7 @@ class MessagePayload(BaseModel):
     audio_duration_ms: Optional[int] = None
     expression: Optional[str] = None
     device_serial: Optional[str] = None
+    agent_id: Optional[str] = None
 
 class ConversationSyncCreate(BaseModel):
     localId: Optional[str] = None
@@ -42,6 +43,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     device_serial: Optional[str] = None
+    agent_id: Optional[str] = None
     created_at: datetime
 
 class DeviceLinkAction(BaseModel):
@@ -116,6 +118,7 @@ async def sync_create_conversation(
             audio_duration_ms=msg_data.audio_duration_ms,
             expression=msg_data.expression,
             device_serial=msg_data.device_serial,
+            agent_id=msg_data.agent_id,
         ).on_conflict_do_nothing(index_elements=['id'])
         await session.execute(stmt)
 
@@ -169,6 +172,7 @@ async def sync_update_conversation(
             audio_duration_ms=msg_data.audio_duration_ms,
             expression=msg_data.expression,
             device_serial=msg_data.device_serial,
+            agent_id=msg_data.agent_id,
         ).on_conflict_do_nothing(index_elements=['id'])
         await session.execute(stmt)
 
@@ -386,6 +390,7 @@ async def list_conversations(
                     "role": m.role,
                     "content": m.content,
                     "device_serial": m.device_serial,
+                    "agent_id": m.agent_id,
                     "created_at": m.created_at.isoformat() if m.created_at else None,
                 }
                 for m in msgs
@@ -430,6 +435,7 @@ async def create_conversation(
             conversation_id=conv.id,
             role=m.get("role", "user"),
             content=m.get("content", ""),
+            agent_id=m.get("agent_id"),
         )
         session.add(msg)
 
@@ -446,7 +452,7 @@ async def create_conversation(
         "id": conv.id,
         "title": conv.title,
         "messages": [
-            {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            {"id": m.id, "role": m.role, "content": m.content, "agent_id": m.agent_id, "created_at": m.created_at.isoformat() if m.created_at else None}
             for m in msgs
         ],
     }
@@ -494,6 +500,7 @@ async def update_conversation(
                 conversation_id=conv_id,
                 role=m.get("role", "user"),
                 content=m.get("content", ""),
+                agent_id=m.get("agent_id"),
             )
             session.add(msg)
 
@@ -633,7 +640,7 @@ async def _conv_to_response(conversation: ConversationModel, session: AsyncSessi
         archived=conversation.archived,
         archived_at=conversation.archived_at,
         messages=[
-            MessageOut(id=m.id, role=m.role, content=m.content, device_serial=m.device_serial, created_at=m.created_at)
+            MessageOut(id=m.id, role=m.role, content=m.content, device_serial=m.device_serial, agent_id=m.agent_id, created_at=m.created_at)
             for m in messages
         ],
     )
