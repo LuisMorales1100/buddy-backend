@@ -37,6 +37,7 @@ class ConversationSyncUpdate(BaseModel):
     title: Optional[str] = None
     messages: List[MessagePayload] = []
     link_device_serial: Optional[str] = None
+    replace_last_n: Optional[int] = None
 
 class MessageOut(BaseModel):
     id: str
@@ -107,7 +108,7 @@ async def sync_create_conversation(
 
     for msg_data in data.messages:
         msg_id = msg_data.id or hashlib.sha256(
-            f"{conversation.id}:{msg_data.role}:{msg_data.content}".encode()
+            f"{conversation.id}:{msg_data.role}:{msg_data.content}:{datetime.utcnow().isoformat()}".encode()
         ).hexdigest()[:32]
         stmt = pg_insert(ConversationMessageModel).values(
             id=msg_id,
@@ -159,9 +160,29 @@ async def sync_update_conversation(
             current.append(data.link_device_serial)
             conversation.linked_device_serials = current
 
+    # FIX CRÍTICO: Si es retry, borrar los últimos N mensajes antes de insertar nuevos
+    if data.replace_last_n and data.replace_last_n > 0:
+        from sqlalchemy import desc
+        msg_result = await session.execute(
+            select(ConversationMessageModel.id)
+            .where(ConversationMessageModel.conversation_id == conversation_id)
+            .order_by(desc(ConversationMessageModel.created_at))
+            .limit(data.replace_last_n)
+        )
+        to_delete = [row[0] for row in msg_result.all()]
+        if to_delete:
+            await session.execute(
+                ConversationMessageModel.__table__.delete()
+                .where(ConversationMessageModel.id.in_(to_delete))
+            )
+            print(f"[PUT /sync/{conversation_id}] 🗑️ Eliminados {len(to_delete)} mensajes para retry")
+
     for msg_data in data.messages:
+        # FIX: Hash con timestamp para evitar colisión cuando el mismo contenido
+        # se reenvía en retry. El timestamp cambia en cada request, así que cada
+        # instancia de mensaje tiene un hash único.
         msg_id = msg_data.id or hashlib.sha256(
-            f"{conversation_id}:{msg_data.role}:{msg_data.content}".encode()
+            f"{conversation_id}:{msg_data.role}:{msg_data.content}:{datetime.utcnow().isoformat()}".encode()
         ).hexdigest()[:32]
         stmt = pg_insert(ConversationMessageModel).values(
             id=msg_id,
