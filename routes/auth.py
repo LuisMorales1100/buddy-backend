@@ -132,6 +132,18 @@ OTP_TTL_SECONDS = 600            # 10 min
 OTP_INTENTS_PER_CODE = 5         # máx intentos antes de invalidar
 OTP_MAX_PER_EMAIL_HOUR = 3       # máx códigos enviados por email/hora
 
+# OTP fijo SOLO para emails de test (dominios configurados). En producción,
+# los emails reales siempre usan código random + SMTP.
+TEST_OTP_CODE = os.getenv("TEST_OTP_CODE", "123456")
+TEST_EMAIL_DOMAINS = [
+    d.strip().lower()
+    for d in os.getenv("TEST_EMAIL_DOMAINS", "@buddy.local,@test.com").split(",")
+    if d.strip()
+]
+
+def _is_test_email(email: str) -> bool:
+    return any(email.endswith(domain) for domain in TEST_EMAIL_DOMAINS)
+
 def _gen_otp() -> str:
     # 6 dígitos numéricos, libres de ambigüedad al leerlos por voz/escritura.
     for _ in range(10):
@@ -254,7 +266,12 @@ async def request_code(
             detail="Demasiados códigos enviados. Esperá una hora e intentá de nuevo.",
         )
 
-    code = _gen_otp()
+    # Para emails de test (dominios configurados): OTP fijo, sin enviar email.
+    if _is_test_email(email):
+        code = TEST_OTP_CODE
+        print(f"[TEST OTP] {email} -> {code}")
+    else:
+        code = _gen_otp()
 
     # Guardamos SOLO el hash (defensa ante lectura de memoria), no el código.
     cache.set(
@@ -266,7 +283,8 @@ async def request_code(
     count = (sent["count"] if sent else 0) + 1
     cache.set(rate_key, {"count": count}, ttl=3600)
 
-    await send_otp_email(email, code)
+    if not _is_test_email(email):
+        await send_otp_email(email, code)
 
     return {"message": "Code sent", "expires_in": OTP_TTL_SECONDS}
 
