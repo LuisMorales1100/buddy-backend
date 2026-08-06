@@ -4,9 +4,11 @@ import hashlib
 import base64
 import httpx
 from urllib.parse import urlencode
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from models.async_database import get_session
 
 router = APIRouter(prefix="/auth/shopify", tags=["Auth"])
 
@@ -59,9 +61,12 @@ async def _get_user_info(access_token: str, auth_config: dict) -> dict:
     return {}
 
 
-async def _handle_auth(code: str, code_verifier: str, state: str, nonce: str):
+async def _handle_auth(code: str, code_verifier: str, state: str, nonce: str, session: AsyncSession):
     from routes.auth import create_access_token, create_refresh_token
-    from models.database import UserModel, PurchaseModel, ProductModel
+    from models.async_database import (
+        user_get_by_email, user_create, user_set_shopify_id,
+        purchase_link_to_user, purchase_user_has_purchase, product_get_user_products,
+    )
 
     auth_config = await _get_auth_config()
     token_data = await _exchange_code(code, code_verifier, auth_config)
@@ -77,17 +82,17 @@ async def _handle_auth(code: str, code_verifier: str, state: str, nonce: str):
     if not email:
         raise HTTPException(status_code=401, detail="Could not retrieve customer email")
 
-    user = UserModel.get_by_email(email)
+    user = await user_get_by_email(session, email)
     if not user:
-        user_id = UserModel.create(email, "", name)
+        user_id = await user_create(session, email, name)
     else:
         user_id = user["id"]
 
     if customer_id:
-        UserModel.set_shopify_id(user_id, customer_id)
+        await user_set_shopify_id(session, user_id, customer_id)
 
-    PurchaseModel.link_to_user(email, user_id)
-    has_purchase = PurchaseModel.user_has_purchase(user_id)
+    await purchase_link_to_user(session, email, user_id)
+    has_purchase = await purchase_user_has_purchase(session, user_id)
 
     if not has_purchase:
         raise HTTPException(
@@ -95,7 +100,7 @@ async def _handle_auth(code: str, code_verifier: str, state: str, nonce: str):
             detail="Necesitás una compra verificada de Buddy para acceder.",
         )
 
-    products = ProductModel.get_user_products(user_id)
+    products = await product_get_user_products(session, user_id)
     payload = {"user_id": user_id, "email": email, "role": "user"}
 
     return {
@@ -153,8 +158,11 @@ class CallbackRequest(BaseModel):
 
 
 @router.post("/callback")
-async def callback_post(req: CallbackRequest):
-    return await _handle_auth(req.code, req.code_verifier, req.state, req.nonce)
+async def callback_post(
+    req: CallbackRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    return await _handle_auth(req.code, req.code_verifier, req.state, req.nonce, session)
 
 
 # GET callback for Shopify OAuth redirect (browser)
@@ -164,6 +172,7 @@ async def callback_get(
     state: str = "",
     error: str = "",
     error_description: str = "",
+    session: AsyncSession = Depends(get_session),
 ):
     if error:
         err_html = f"""
@@ -186,7 +195,7 @@ async def callback_get(
         )
 
     try:
-        result = await _handle_auth(code, pkce["code_verifier"], state, pkce["nonce"])
+        result = await _handle_auth(code, pkce["code_verifier"], state, pkce["nonce"], session)
     except HTTPException as e:
         return HTMLResponse(
             f"<html><body><h1>Error</h1><p>{e.detail}</p>"

@@ -3,7 +3,9 @@ import hashlib
 import hmac
 import json
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
+from models.async_database import get_session
 
 router = APIRouter(prefix="/shopify", tags=["Shopify"])
 
@@ -35,8 +37,9 @@ def verify_shopify_webhook(body: bytes, hmac_header: str) -> bool:
 async def shopify_customer_create(
     request: Request,
     x_shopify_hmac_sha256: Optional[str] = Header(None),
+    session: AsyncSession = Depends(get_session),
 ):
-    from models.database import UserModel
+    from models.async_database import user_get_by_email, user_create, user_set_shopify_id
 
     body = await request.body()
     if not verify_shopify_webhook(body, x_shopify_hmac_sha256 or ""):
@@ -52,15 +55,15 @@ async def shopify_customer_create(
     if not email:
         return {"status": "skipped", "reason": "no email"}
 
-    user = UserModel.get_by_email(email)
+    user = await user_get_by_email(session, email)
     if not user:
-        user_id = UserModel.create(email, "", name)
+        user_id = await user_create(session, email, name)
         print(f"[Shopify] User created from webhook: {email}")
     else:
         user_id = user["id"]
 
     if customer_id:
-        UserModel.set_shopify_id(user_id, customer_id)
+        await user_set_shopify_id(session, user_id, customer_id)
         print(f"[Shopify] Customer {customer_id} linked to user {user_id}")
 
     return {"status": "ok", "email": email, "customer_id": customer_id}
@@ -71,8 +74,9 @@ async def shopify_order_create(
     request: Request,
     x_shopify_hmac_sha256: Optional[str] = Header(None),
     x_shopify_topic: Optional[str] = Header(None),
+    session: AsyncSession = Depends(get_session),
 ):
-    from models.database import PurchaseModel, UserModel
+    from models.async_database import user_get_by_email, user_create, purchase_create
 
     body = await request.body()
     data = json.loads(body)
@@ -88,15 +92,16 @@ async def shopify_order_create(
         raise HTTPException(status_code=400, detail="Missing email or order ID")
 
     # Create user if not exists
-    user = UserModel.get_by_email(email)
+    user = await user_get_by_email(session, email)
     if not user:
-        UserModel.create(email, "", "")
+        user_id = await user_create(session, email)
         print(f"[Shopify] User auto-created from order: {email}")
 
     for item in line_items:
         sku = item.get("sku", "buddy_v1")
         name = item.get("title", "Buddy Assistant")
-        PurchaseModel.create(
+        await purchase_create(
+            session,
             email=email,
             shopify_order_id=order_id,
             product_sku=sku,
@@ -111,7 +116,10 @@ async def shopify_order_create(
 async def shopify_order_updated(
     request: Request,
     x_shopify_hmac_sha256: Optional[str] = Header(None),
+    session: AsyncSession = Depends(get_session),
 ):
+    from models.async_database import purchase_verify_by_order_id
+
     body = await request.body()
     if not verify_shopify_webhook(body, x_shopify_hmac_sha256 or ""):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
@@ -121,35 +129,27 @@ async def shopify_order_updated(
     financial_status = data.get("financial_status", "")
 
     if financial_status in ("paid", "fulfilled"):
-        import sqlite3
-        import pathlib
-
-        conn = sqlite3.connect(
-            pathlib.Path(__file__).parent.parent / "buddy.db"
-        )
-        conn.execute(
-            "UPDATE purchases SET verified = 1 WHERE shopify_order_id = ?",
-            (order_id,),
-        )
-        conn.commit()
-        conn.close()
+        await purchase_verify_by_order_id(session, order_id)
         print(f"[Shopify] Order {order_id} verified (paid)")
 
     return {"status": "ok", "order_id": order_id}
 
 
 @router.post("/admin/verify-purchase")
-async def admin_verify_purchase(email: str, _=Depends(require_admin)):
-    from models.database import PurchaseModel, UserModel
+async def admin_verify_purchase(
+    email: str, _=Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    from models.async_database import purchase_get_by_email, purchase_create, user_get_by_email, purchase_link_to_user
 
-    purchase = PurchaseModel.get_by_email(email)
+    purchase = await purchase_get_by_email(session, email)
     if not purchase:
-        PurchaseModel.create(email=email, shopify_order_id=f"manual_{email}")
-        purchase = PurchaseModel.get_by_email(email)
+        await purchase_create(session, email=email, shopify_order_id=f"manual_{email}")
+        purchase = await purchase_get_by_email(session, email)
 
-    user = UserModel.get_by_email(email)
+    user = await user_get_by_email(session, email)
     if user:
-        PurchaseModel.link_to_user(email, user["id"])
+        await purchase_link_to_user(session, email, user["id"])
 
     return {
         "status": "verified",

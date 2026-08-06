@@ -4,12 +4,10 @@
 CREATE TABLE IF NOT EXISTS users (
     id              SERIAL PRIMARY KEY,
     email           TEXT UNIQUE NOT NULL,
-    password_hash   TEXT NOT NULL,
     name            TEXT NOT NULL DEFAULT '',
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     shopify_customer_id TEXT,
-    stripe_customer_id  TEXT,
-    password_set    INTEGER DEFAULT 0
+    stripe_customer_id  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS devices (

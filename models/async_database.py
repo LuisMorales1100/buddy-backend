@@ -39,13 +39,11 @@ class Base(DeclarativeBase):
 class UserModel(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    email = Column(String, unique=True, nullable=False)
-    password_hash = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False, index=True)
     name = Column(String, nullable=False, default="")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     shopify_customer_id = Column(String, nullable=True)
     stripe_customer_id = Column(String, nullable=True)
-    password_set = Column(Integer, nullable=False, default=0)
 
 
 class DeviceModel(Base):
@@ -196,8 +194,8 @@ def _deep_merge(target: dict, source: dict) -> dict:
             result[key] = value
     return result
 
-async def user_create(session: AsyncSession, email: str, password_hash: str, name: str = ""):
-    user = UserModel(email=email, password_hash=password_hash, name=name)
+async def user_create(session: AsyncSession, email: str, name: str = ""):
+    user = UserModel(email=email, name=name)
     session.add(user)
     await session.flush()
     return user.id
@@ -211,14 +209,6 @@ async def user_get_by_email(session: AsyncSession, email: str):
 async def user_get_by_id(session: AsyncSession, user_id: int):
     result = await session.execute(select(UserModel).where(UserModel.id == user_id))
     return _orm_to_dict(result.scalar_one_or_none())
-
-
-async def user_set_password(session: AsyncSession, user_id: int, password_hash: str):
-    result = await session.execute(select(UserModel).where(UserModel.id == user_id))
-    user = result.scalar_one_or_none()
-    if user:
-        user.password_hash = password_hash
-        user.password_set = 1
 
 
 async def user_set_shopify_id(session: AsyncSession, user_id: int, shopify_id: str):

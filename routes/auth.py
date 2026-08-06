@@ -1,7 +1,6 @@
 import os
 import hashlib
 import secrets
-import bcrypt
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Header, Depends, Response, Request
 from pydantic import BaseModel
@@ -9,6 +8,8 @@ from typing import Optional
 from jose import jwt as jose_jwt, JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 from services.limiter import limiter
+from services.cache import cache
+from services.email_sender import send_otp_email
 from models.async_database import get_session
 
 JWT_SECRET = os.getenv("JWT_SECRET", "")
@@ -103,25 +104,17 @@ def get_token_from_request(request: Request, authorization: Optional[str] = None
     return None
 
 
-class RegisterRequest(BaseModel):
+class RequestCodeRequest(BaseModel):
     email: str
-    password: str
-    name: str = ""
 
 
-class LoginRequest(BaseModel):
+class VerifyCodeRequest(BaseModel):
     email: str
-    password: str
+    code: str
 
 
 class RefreshRequest(BaseModel):
     refresh_token: str
-
-
-class SetPasswordRequest(BaseModel):
-    email: str
-    password: str
-    code: str
 
 
 class PairDeviceRequest(BaseModel):
@@ -134,22 +127,18 @@ class DeviceRegisterRequest(BaseModel):
     name: str = "Buddy"
 
 
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+# ---- Login OTP por email ----
+OTP_TTL_SECONDS = 600            # 10 min
+OTP_INTENTS_PER_CODE = 5         # máx intentos antes de invalidar
+OTP_MAX_PER_EMAIL_HOUR = 3       # máx códigos enviados por email/hora
 
-
-def verify_password(password: str, stored: str) -> bool:
-    if stored.startswith("$2b$") or stored.startswith("$2a$"):
-        try:
-            return bcrypt.checkpw(password.encode(), stored.encode())
-        except Exception:
-            return False
-    parts = stored.split(":")
-    if len(parts) != 2:
-        return False
-    salt, expected = parts
-    h = hashlib.sha256((salt + password).encode()).hexdigest()
-    return h == expected
+def _gen_otp() -> str:
+    # 6 dígitos numéricos, libres de ambigüedad al leerlos por voz/escritura.
+    for _ in range(10):
+        code = f"{secrets.randbelow(1000000):06d}"
+        if code[0] != "0":
+            return code
+    return f"{secrets.randbelow(1000000):06d}"
 
 
 # ---- JWT usando python-jose (HMAC-SHA256 estándar) ----
@@ -245,84 +234,91 @@ async def get_current_user(
     return payload
 
 
-# ===== Internal registration (webhook-only) =====
-async def internal_register(session: AsyncSession, email: str, name: str = "") -> Optional[int]:
-    from models.async_database import user_create
-    return await user_create(session, email, "", name)
-
-
 # ===== Routes =====
 
-@router.post("/auth/login")
-@limiter.limit("10/minute")
-async def login(
-    request: Request, req: LoginRequest, response: Response,
-    session: AsyncSession = Depends(get_session),
+@router.post("/auth/request-code")
+@limiter.limit("5/minute")
+async def request_code(
+    request: Request, req: RequestCodeRequest, response: Response,
 ):
-    from models.async_database import (
-        user_get_by_email, purchase_link_to_user, purchase_user_has_purchase, product_get_user_products,
+    email = req.email.strip().lower()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=422, detail="Email inválido")
+
+    # Limitar códigos enviados por email para frustrar spam de login.
+    rate_key = f"otp_rate:{email}"
+    sent = cache.get(rate_key)
+    if sent and sent["count"] >= OTP_MAX_PER_EMAIL_HOUR:
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiados códigos enviados. Esperá una hora e intentá de nuevo.",
+        )
+
+    code = _gen_otp()
+
+    # Guardamos SOLO el hash (defensa ante lectura de memoria), no el código.
+    cache.set(
+        f"otp:{email}",
+        {"hash": hashlib.sha256(code.encode()).hexdigest(), "intents": OTP_INTENTS_PER_CODE},
+        ttl=OTP_TTL_SECONDS,
     )
 
-    user = await user_get_by_email(session, req.email)
-    if not user or not verify_password(req.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Email o contraseña incorrectos")
+    count = (sent["count"] if sent else 0) + 1
+    cache.set(rate_key, {"count": count}, ttl=3600)
 
-    if not user.get("password_set", 0):
-        raise HTTPException(
-            status_code=401,
-            detail="Debés configurar tu contraseña primero. Revisá tu email.",
-        )
+    await send_otp_email(email, code)
 
-    await purchase_link_to_user(session, req.email, user["id"])
-    has_purchase = await purchase_user_has_purchase(session, user["id"])
+    return {"message": "Code sent", "expires_in": OTP_TTL_SECONDS}
 
-    if not has_purchase:
-        raise HTTPException(
-            status_code=402,
-            detail="Necesitás una compra verificada de Buddy para acceder.",
-        )
 
-    products = await product_get_user_products(session, user["id"])
+@router.post("/auth/verify-code")
+@limiter.limit("10/minute")
+async def verify_code(
+    request: Request, req: VerifyCodeRequest, response: Response,
+    session: AsyncSession = Depends(get_session),
+):
+    from models.async_database import user_get_by_email, user_create
 
-    payload = {"user_id": user["id"], "email": user["email"], "role": "user"}
+    email = req.email.strip().lower()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=422, detail="Email inválido")
+
+    record = cache.get(f"otp:{email}")
+    if not record:
+        raise HTTPException(status_code=401, detail="Código inválido o expirado. Pedí uno nuevo.")
+
+    if record["hash"] != hashlib.sha256(req.code.strip().encode()).hexdigest():
+        record["intents"] -= 1
+        if record["intents"] <= 0:
+            cache.delete(f"otp:{email}")
+            raise HTTPException(status_code=401, detail="Código incorrecto. Solicitalo de nuevo.")
+        cache.set(f"otp:{email}", record, ttl=OTP_TTL_SECONDS)
+        raise HTTPException(status_code=401, detail="Código incorrecto.")
+
+    cache.delete(f"otp:{email}")
+
+    # Verificar que el código coincide ES el login: buscamos (o creamos) el usuario.
+    user = await user_get_by_email(session, email)
+    if user:
+        user_id = user["id"]
+        name = user["name"]
+    else:
+        user_id = await user_create(session, email)
+        name = ""
+
+    payload = {"user_id": user_id, "email": email, "role": "user"}
     access_token = create_access_token(payload)
     refresh_token = create_refresh_token(payload)
 
-    # Set httpOnly cookies for browser clients (XSS-safe)
     set_auth_cookies(response, access_token, refresh_token)
 
     return {
         "token": access_token,
         "refresh_token": refresh_token,
-        "user_id": user["id"],
-        "email": user["email"],
-        "name": user["name"],
-        "has_purchase": True,
-        "products": products,
+        "user_id": user_id,
+        "email": email,
+        "name": name,
     }
-
-
-@router.post("/auth/set-password")
-async def set_password(
-    req: SetPasswordRequest,
-    session: AsyncSession = Depends(get_session),
-):
-    from models.async_database import user_get_by_email, user_set_password
-
-    expected = hashlib.sha256((req.email + JWT_SECRET).encode()).hexdigest()[:12]
-    if req.code != expected:
-        raise HTTPException(status_code=401, detail="Código inválido o expirado")
-
-    if len(req.password) < 6:
-        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
-
-    user = await user_get_by_email(session, req.email)
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
-    await user_set_password(session, user["id"], hash_password(req.password))
-
-    return {"status": "ok", "message": "Contraseña configurada. Ya podés iniciar sesión."}
 
 
 @router.post("/auth/refresh")
