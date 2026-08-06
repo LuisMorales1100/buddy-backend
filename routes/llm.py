@@ -141,9 +141,6 @@ async def chat(
     # FASE 1: Inyectar historial de conversación desde PostgreSQL
     request = await _inject_history(request, session, auth)
 
-    if BUDDY_CLOUD_URL and request.provider == "buddy_cloud":
-        return await proxy_buddy_cloud(request)
-
     errors = []
 
     async def try_provider(provider: str) -> LLMResponse:
@@ -374,27 +371,38 @@ async def proxy_buddy_cloud(request: LLMRequest) -> LLMResponse:
     if LLM_SERVICE_API_KEY:
         headers["x-api-key"] = LLM_SERVICE_API_KEY
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        res = await client.post(
-            BUDDY_CLOUD_URL,
-            headers=headers,
-            json={
-                "model": request.model or "buddy-llm",
-                "messages": messages,
-                "temperature": request.temperature,
-                "agent_id": request.agent_id,
-                "conversation_id": request.conversation_id,
-            },
-        )
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail=sanitize(res.text))
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            res = await client.post(
+                BUDDY_CLOUD_URL,
+                headers=headers,
+                json={
+                    "model": request.model or "buddy-llm",
+                    "messages": messages,
+                    "temperature": request.temperature,
+                    "agent_id": request.agent_id,
+                    "conversation_id": request.conversation_id,
+                },
+            )
+    except httpx.ConnectError:
+        log.warning("llm.buddy_cloud_connect_error", url=BUDDY_CLOUD_URL)
+        raise HTTPException(status_code=503, detail="buddy_cloud_unavailable")
+    except httpx.TimeoutException:
+        log.warning("llm.buddy_cloud_timeout", url=BUDDY_CLOUD_URL)
+        raise HTTPException(status_code=503, detail="buddy_cloud_unavailable")
+    except Exception as e:
+        log.warning("llm.buddy_cloud_error", error=str(e)[:200])
+        raise HTTPException(status_code=503, detail="buddy_cloud_unavailable")
 
-        data = res.json()
-        text = (
-            data.get("response")
-            or data.get("reply")
-            or data.get("text")
-            or data.get("message", {}).get("content", "")
-            or str(data)
-        )
-        return LLMResponse(text=text, provider="buddy_cloud", model=data.get("model"))
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail=sanitize(res.text))
+
+    data = res.json()
+    text = (
+        data.get("response")
+        or data.get("reply")
+        or data.get("text")
+        or data.get("message", {}).get("content", "")
+        or str(data)
+    )
+    return LLMResponse(text=text, provider="buddy_cloud", model=data.get("model"))
