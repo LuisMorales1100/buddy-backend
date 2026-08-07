@@ -3,6 +3,7 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Header, Depends, Response, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from jose import jwt as jose_jwt, JWTError
@@ -38,6 +39,8 @@ if ENV == "production" and JWT_SECRET in (
 
 TOKEN_EXPIRE_MINUTES = 120
 REFRESH_TOKEN_EXPIRE_DAYS = 30
+DEVICE_TOKEN_EXPIRE_DAYS = 3650  # 10 años: el ESP32 no hace refresh en runtime
+REFRESH_TOKEN_COOKIE = os.getenv("REFRESH_TOKEN_COOKIE", "true").lower() == "true"
 COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "")
 COOKIE_SECURE = os.getenv("ENV", "development") == "production"
 
@@ -88,6 +91,22 @@ def clear_auth_cookies(response: Response):
             domain=COOKIE_DOMAIN if COOKIE_SECURE else None,
             path="/",
         )
+
+
+def _set_refresh_cookie(response: Response, refresh_token: str, max_age_days: int = 30) -> Response:
+    """Set httpOnly refresh token cookie."""
+    if not REFRESH_TOKEN_COOKIE:
+        return response
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        max_age=timedelta(days=max_age_days),
+        httponly=True,
+        secure=False,  # True en producción (HTTPS), False en dev
+        samesite="strict",
+        path="/v1/auth/refresh",
+    )
+    return response
 
 
 def get_token_from_request(request: Request, authorization: Optional[str] = None) -> Optional[str]:
@@ -221,6 +240,24 @@ def create_refresh_token(payload: dict) -> str:
     return _encode_jwt(token_payload, REFRESH_SECRET)
 
 
+def create_device_token(payload: dict) -> str:
+    """Token de larga vida para dispositivos.
+
+    El ESP32 registra una sola vez y persiste el token en NVS sin refresh
+    (registerWithBackend() sale temprano si config.registered). Devolverle un
+    access token con TTL de 120 min rompe a las 2 horas de uptime (401).
+    Por eso el device token no expira en días de uptime razonables.
+    """
+    exp = datetime.utcnow() + timedelta(days=DEVICE_TOKEN_EXPIRE_DAYS)
+    token_payload = {
+        **payload,
+        "exp": int(exp.timestamp()),
+        "iat": int(datetime.utcnow().timestamp()),
+        "type": "access",
+    }
+    return _encode_jwt(token_payload, JWT_SECRET)
+
+
 def decode_token(token: str) -> Optional[dict]:
     return _verify(token, JWT_SECRET)
 
@@ -330,19 +367,31 @@ async def verify_code(
 
     set_auth_cookies(response, access_token, refresh_token)
 
-    return {
+    response_data = {
         "token": access_token,
         "refresh_token": refresh_token,
         "user_id": user_id,
         "email": email,
         "name": name,
     }
+    response = JSONResponse(content=response_data)
+    response = _set_refresh_cookie(response, refresh_token)
+    return response
 
 
 @router.post("/auth/refresh")
 async def refresh(req: RefreshRequest, response: Response, request: Request):
-    # Try refresh from cookie first, then request body
-    refresh_token = request.cookies.get("buddy_refresh") or req.refresh_token
+    # Try refresh from cookie first, then request body (esquema dual).
+    # Prioridad: cookie httpOnly "refresh_token" (nuevo), luego cookie legacy
+    # "buddy_refresh", luego body (PWA fallback).
+    refresh_token = (
+        request.cookies.get("refresh_token")
+        or request.cookies.get("buddy_refresh")
+        or req.refresh_token
+    )
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="No refresh token provided")
+
     payload = _verify(refresh_token, REFRESH_SECRET)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
@@ -357,10 +406,15 @@ async def refresh(req: RefreshRequest, response: Response, request: Request):
 
     set_auth_cookies(response, access_token, new_refresh_token)
 
-    return {
-        "token": access_token,
-        "refresh_token": new_refresh_token,
-    }
+    # Response con cookie httpOnly de refresh (esquema délel)
+    response_data = {"token": access_token}
+    if not request.cookies.get("refresh_token"):
+        # Si vino de body/legacy (sin cookie nueva), devolver refresh_token en body
+        response_data["refresh_token"] = new_refresh_token
+    response = JSONResponse(content=response_data)
+    response = _set_refresh_cookie(response, new_refresh_token)
+
+    return response
 
 
 @router.post("/auth/logout")
@@ -407,7 +461,7 @@ async def register_device(
 
     await device_upsert(session, serial=req.serial, name=req.name)
 
-    token = create_access_token(
+    token = create_device_token(
         {"serial": req.serial, "role": "device"}
     )
     return {
