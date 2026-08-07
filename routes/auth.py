@@ -42,7 +42,10 @@ REFRESH_TOKEN_EXPIRE_DAYS = 30
 DEVICE_TOKEN_EXPIRE_DAYS = 3650  # 10 años: el ESP32 no hace refresh en runtime
 REFRESH_TOKEN_COOKIE = os.getenv("REFRESH_TOKEN_COOKIE", "true").lower() == "true"
 COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "")
-COOKIE_SECURE = os.getenv("ENV", "development") == "production"
+# secure de cookies: configurable por env (default: true en production).
+# Dev (HTTP) -> false; Prod (HTTPS) -> true. Si no se setea, derivar de ENV.
+_env_secure = os.getenv("COOKIE_SECURE")
+COOKIE_SECURE = _env_secure.lower() == "true" if _env_secure is not None else os.getenv("ENV", "development") == "production"
 
 router = APIRouter(prefix="", tags=["Auth"])
 
@@ -102,7 +105,7 @@ def _set_refresh_cookie(response: Response, refresh_token: str, max_age_days: in
         value=refresh_token,
         max_age=timedelta(days=max_age_days),
         httponly=True,
-        secure=False,  # True en producción (HTTPS), False en dev
+        secure=COOKIE_SECURE,  # configurable por env (dev=HTTP false, prod=HTTPS true)
         samesite="strict",
         path="/v1/auth/refresh",
     )
